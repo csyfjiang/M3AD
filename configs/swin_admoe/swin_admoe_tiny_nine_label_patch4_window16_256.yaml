@@ -1,0 +1,246 @@
+# Description:
+# Author: JeffreyJ
+# Date: 2025/7/14
+# LastEditTime: 2025/7/14 12:51
+# Version: 1.0
+
+# Alzheimer's Disease Dual-Task Classification with SimMIM Pretraining Configuration
+# Nine Label Version - 7 Change Classes
+# config/swin_admoe_tiny_nine_label_patch4_window16_256.yaml
+
+
+DATA:
+  DATASET: 'alzheimer'
+  DATA_PATH: 'D://codebase//Swin-Transformer//examples_nine_labels'  # Windows path D://codebase//Swin-Transformer//examples Z://yufengjiang//data//slice data/external_slices_for_pt_ft
+  IMG_SIZE: 256
+  BATCH_SIZE: 9999
+  NUM_WORKERS: 4
+  PIN_MEMORY: True
+  INTERPOLATION: 'bicubic'
+  # Phase-specific batch sizes
+  BATCH_SIZE_PRETRAIN: 8  # Batch size for pretraining phase
+  BATCH_SIZE_FINETUNE: 4  # Batch size for finetuning phase
+
+MODEL:
+  TYPE: swin_admoe_nine_label  # Use nine-label version
+  NAME: swin_admoe_tiny_nine_label_patch4_window16_256
+  NUM_CLASSES: 3  # Keep for compatibility
+  DROP_RATE: 0.0
+  DROP_PATH_RATE: 0.1
+  LABEL_SMOOTHING: 0.1
+
+  # SimMIM Configuration
+  SIMMIM:
+    MASK_RATIO: 0.6  # Ratio of patches to mask
+    NORM_TARGET:
+      ENABLE: True   # Whether to normalize target
+      PATCH_SIZE: 47 # Patch size for target normalization
+
+  SWIN_ADMOE_NINE_LABEL:
+    # Dual-task class numbers - 7-class version
+    NUM_CLASSES_DIAGNOSIS: 3  # CN(1), MCI(2), Dementia(3)
+    NUM_CLASSES_CHANGE: 7     # 7 refined transition types
+    # Change labels:
+    # 1: Stable CN to CN
+    # 2: Stable MCI to MCI
+    # 3: Stable AD to AD
+    # 4: Conversion CN to MCI
+    # 5: Conversion MCI to AD
+    # 6: Conversion CN to AD
+    # 7: Reversion MCI to CN
+
+    # Model architecture parameters
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 96
+    DEPTHS: [2, 2, 6, 2]
+    NUM_HEADS: [3, 6, 12, 24]
+    WINDOW_SIZE: 8
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [8, 8, 8, 4]
+    IS_PRETRAIN: True   # Start with pretraining mode
+
+    # Clinical Prior Settings
+    USE_CLINICAL_PRIOR: True
+    PRIOR_DIM: 3              # 3-dimensional clinical prior vector
+    PRIOR_HIDDEN_DIM: 128     # MLP hidden layer dimension
+    FUSION_STAGE: 2           # Fusion after stage 2
+    FUSION_TYPE: 'adaptive'   # 'adaptive', 'concat', 'add', 'hadamard'
+
+    # Expert Configuration - 8-expert system
+    NUM_EXPERTS: 8  # 2 shared + 2 CN + 2 MCI + 2 AD
+    EXPERT_ASSIGNMENT_PRETRAIN: 'diagnosis_based'  # Use only diagnosis labels during pretraining
+    EXPERT_ASSIGNMENT_FINETUNE: 'learned'         # Learn gating during finetuning
+
+    # ShiftedBlock Configuration - new
+    USE_SHIFTED_LAST_LAYER: True  # Whether to use ShiftedBlock in the last layer
+    SHIFT_MLP_RATIO: 1.0          # MLP ratio for ShiftedBlock (if used)
+
+# Data augmentation settings (conservative for medical images)
+AUG:
+  # Basic augmentation
+  COLOR_JITTER: 0.0  # Medical images don't need color jitter
+  AUTO_AUGMENT: 'rand-m5-mstd0.5-inc1'  # Options: 'rand-m5-mstd0.5-inc1', 'none'
+
+  # Random Erasing (disabled for medical images)
+  REPROB: 0.0
+  REMODE: 'pixel'
+  RECOUNT: 1
+
+  # Mixup/CutMix (disabled for medical images during pretraining)
+  MIXUP: 0.0
+  CUTMIX: 0.0
+  CUTMIX_MINMAX: [0.3, 0.7]
+  MIXUP_PROB: 0.0
+  MIXUP_SWITCH_PROB: 0.5
+  MIXUP_MODE: 'batch'
+
+# Training settings
+TRAIN:
+  START_EPOCH: 0
+  EPOCHS: 20
+
+  # Phase-specific settings
+  PRETRAIN_EPOCHS: 10  # First 50 epochs for SimMIM pretraining
+
+  # Learning rate settings
+  BASE_LR: 1e-4         # Base learning rate
+  MIN_LR: 1e-6          # Minimum learning rate
+
+  # Warmup settings
+  WARMUP_EPOCHS: 10     # Warmup epochs
+  WARMUP_LR: 1e-6       # Warmup learning rate
+
+  # Weight decay and regularization
+  WEIGHT_DECAY: 0.05
+
+  # Gradient settings
+  CLIP_GRAD: 1.0
+  AUTO_RESUME: True
+  ACCUMULATION_STEPS: 1
+  USE_CHECKPOINT: False  # Set to True if GPU memory is insufficient
+
+  # Optimizer
+  OPTIMIZER:
+    NAME: 'adamw'
+    EPS: 1e-8
+    BETAS: [0.9, 0.999]
+    MOMENTUM: 0.9
+
+  # LR scheduler
+  LR_SCHEDULER:
+    NAME: 'cosine'
+    DECAY_EPOCHS: 30
+    DECAY_RATE: 0.1
+    WARMUP_PREFIX: True
+
+# Test settings
+TEST:
+  CROP: False
+  SEQUENTIAL: False
+  SHUFFLE: False
+
+# Mixed precision training
+AMP_ENABLE: True
+
+# Basic settings
+SEED: 42
+OUTPUT: './output/alzheimer_nine_label'
+TAG: 'simmim_pretrain_7class_v1'
+SAVE_FREQ: 20  # Save every 20 epochs
+PRINT_FREQ: 50
+EVAL_MODE: False
+THROUGHPUT_MODE: False
+LOCAL_RANK: 0
+
+# Distributed training
+FUSED_WINDOW_PROCESS: False
+FUSED_LAYERNORM: False
+
+# WandB settings
+WANDB:
+  PROJECT: 'alzheimer-nine-label-classification-shiftedblock'
+  NAME: 'swin_admoe_nine_label_pretrain'
+  TAGS: ['simmim', 'dual-task', 'alzheimer', 'swin-admoe', '7-class-change', '8-experts']
+
+# Loss weights (for finetuning phase)
+LOSS:
+  WEIGHT_DIAGNOSIS: 1.0  # Diagnosis task weight
+  WEIGHT_CHANGE: 1.0     # Change task weight
+
+# Evaluation settings
+EVAL:
+  INTERVAL: 10  # Validate every 10 epochs
+  SAVE_BEST: True
+  METRICS: ['accuracy', 'f1_score', 'confusion_matrix']
+  # Detailed reporting during evaluation
+  DETAILED_REPORT: True
+  SAVE_PREDICTIONS: True  # Save prediction results for analysis
+
+# Early stopping settings
+EARLY_STOP:
+  ENABLE: True
+  PATIENCE: 10   # Increased patience for 7-class problem
+  MONITOR: 'val_loss'  # For pretraining: reconstruction loss, for finetuning: classification loss
+  DELTA: 0.0001  # Minimum change to qualify as improvement
+
+# Phase-specific configurations
+PHASES:
+  PRETRAIN:
+    DESCRIPTION: "SimMIM self-supervised pretraining with 8 experts"
+    LOSS_TYPE: "reconstruction"
+    EXPERT_ASSIGNMENT: "diagnosis_label_based"  # Only use diagnosis labels
+    EVALUATION_METRIC: "reconstruction_loss"
+    MASK_RATIO_SCHEDULE: [0.6, 0.6, 0.6]  # Can vary mask ratio across epochs
+
+  FINETUNE:
+    DESCRIPTION: "Dual-task classification finetuning (3 diagnosis + 7 change classes)"
+    LOSS_TYPE: "classification"
+    EXPERT_ASSIGNMENT: "learned_adaptive_gating"
+    EVALUATION_METRIC: "classification_accuracy"
+    # Class weights (for handling class imbalance if needed)
+    CLASS_WEIGHTS_DIAGNOSIS: [1.0, 1.0, 1.0]  # CN, MCI, AD
+    CLASS_WEIGHTS_CHANGE: [1.0, 1.0, 1.0, 1.5, 1.5, 2.0, 2.0]  # Lower weights for stable classes, higher for rare transitions
+
+# Expert Configuration Details
+EXPERTS:
+  DESCRIPTION: "8-expert system for fine-grained modeling"
+  ALLOCATION:
+    SHARED: [0, 1]      # Experts 0-1: General shared experts
+    CN: [2, 3]          # Experts 2-3: CN-specialized
+    MCI: [4, 5]         # Experts 4-5: MCI-specialized
+    AD: [6, 7]          # Experts 6-7: AD-specialized
+  ROUTING_TEMPERATURE:
+    PRETRAIN: 1.0       # Temperature for expert routing during pretraining
+    FINETUNE: 0.5       # Lower temperature for sharper routing during finetuning
+
+# Data Loading Configuration
+DATALOADER:
+  # Whether to use weighted sampling for class balancing
+  USE_WEIGHTED_SAMPLING: False
+  # Prefetch factor for data loading
+  PREFETCH_FACTOR: 2
+  # Whether to persist worker processes
+  PERSISTENT_WORKERS: True
+
+# Logging Configuration
+LOGGING:
+  # Frequency for logging expert utilization
+  LOG_EXPERT_UTILIZATION_FREQ: 5  # Every 5 epochs
+  # Whether to save attention maps
+  SAVE_ATTENTION_MAPS: False
+  # Whether to log gradient statistics
+  LOG_GRADIENT_STATS: False
+
+# Debugging Options
+DEBUG:
+  # Whether to use a small dataset for quick debugging
+  USE_SMALL_DATASET: False
+  SMALL_DATASET_SIZE: 100
+  # Whether to print detailed model structure
+  PRINT_MODEL_DETAILS: True
+  # Whether to check data loading
+  CHECK_DATA_LOADING: True

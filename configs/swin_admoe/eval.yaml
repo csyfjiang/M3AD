@@ -1,0 +1,145 @@
+# Alzheimer's Disease Dual-Task Classification Evaluation Configuration
+# configs/eval.yaml - Standalone configuration file
+
+# Data settings for evaluation
+DATA:
+  DATASET: 'alzheimer'
+  DATA_PATH: 'Z://yufengjiang//data//slice'  # Evaluation data path
+  IMG_SIZE: 256
+  BATCH_SIZE: 16
+  NUM_WORKERS: 4
+  PIN_MEMORY: True
+  INTERPOLATION: 'bicubic'
+
+# Model settings - Complete copy of training configuration
+MODEL:
+  TYPE: swin_admoe
+  NAME: swin_admoe_tiny_finetune_patch4_window16_256
+  NUM_CLASSES: 3  # Keep for compatibility
+  DROP_RATE: 0.0
+  DROP_PATH_RATE: 0.1
+  LABEL_SMOOTHING: 0.1
+
+  SWIN_ADMOE:
+    # Dual-task class numbers
+    NUM_CLASSES_DIAGNOSIS: 3  # CN(1), MCI(2), Dementia(3)
+    NUM_CLASSES_CHANGE: 3     # Stable(1), Conversion(2), Reversion(3)
+
+    # Model architecture parameters
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 96
+    DEPTHS: [2, 2, 6, 2]
+    NUM_HEADS: [3, 6, 12, 24]
+    WINDOW_SIZE: 16
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [12, 12, 12, 6]
+    SHIFT_MLP_RATIO: 1.0
+    IS_PRETRAIN: False  # Use fine-tuning mode during evaluation
+    USE_SHIFTED_LAST_LAYER: False
+
+# Evaluation-specific data augmentation settings (minimal augmentation)
+AUG:
+  COLOR_JITTER: 0.0
+  AUTO_AUGMENT: 'none'
+  REPROB: 0.0
+  REMODE: 'pixel'
+  RECOUNT: 1
+  MIXUP: 0.0
+  CUTMIX: 0.0
+  CUTMIX_MINMAX: null
+  MIXUP_PROB: 0.0
+  MIXUP_SWITCH_PROB: 0.5
+  MIXUP_MODE: 'batch'
+
+# Training settings (not used during evaluation, but kept for compatibility)
+TRAIN:
+  START_EPOCH: 0
+  EPOCHS: 200
+  WARMUP_EPOCHS: 10
+  WARMUP_LR: 1e-6
+  BASE_LR: 1e-4
+  MIN_LR: 1e-6
+  PRETRAIN_EPOCHS: 20
+  WEIGHT_DECAY: 0.05
+  CLIP_GRAD: 1.0
+  AUTO_RESUME: True
+  ACCUMULATION_STEPS: 1
+  USE_CHECKPOINT: False
+
+  OPTIMIZER:
+    NAME: 'adamw'
+    EPS: 1e-8
+    BETAS: [0.9, 0.999]
+    MOMENTUM: 0.9
+
+  LR_SCHEDULER:
+    NAME: 'cosine'
+    DECAY_EPOCHS: 30
+    DECAY_RATE: 0.1
+    WARMUP_PREFIX: True
+
+# Test settings
+TEST:
+  CROP: False
+  SEQUENTIAL: True  # Use sequential sampling during evaluation
+  SHUFFLE: False
+
+# Evaluation specific settings
+EVAL:
+  # Checkpoint path
+  CHECKPOINT_PATH: 'D:\\codebase\\Swin-Transformer\\ckpt\\checkpoint_epoch_24.pth'
+
+  # Output settings
+  OUTPUT_DIR: './eval_results'
+  SAVE_PREDICTIONS: True
+  SAVE_FEATURES: False
+  VISUALIZATION: True
+
+  # Evaluation settings
+  BATCH_SIZE: 32  # Can use larger batch size during evaluation
+  USE_TTA: False  # Test Time Augmentation
+
+  # Single sample inference settings
+  SINGLE:
+    INPUT_PATH: ''  # Specified through command line arguments
+    OUTPUT_PATH: './single_prediction.json'
+
+  # Batch inference settings
+  BATCH:
+    INPUT_DIR: ''  # Specified through command line arguments
+    OUTPUT_DIR: './batch_predictions'
+    RECURSIVE: False
+
+# Loss settings (kept for compatibility)
+LOSS:
+  WEIGHT_DIAGNOSIS: 1.0
+  WEIGHT_CHANGE: 1.0
+
+# Early stopping settings (kept for compatibility)
+EARLY_STOP:
+  ENABLE: True
+  PATIENCE: 5
+  MONITOR: 'val_loss'
+
+# WandB settings (kept for compatibility)
+WANDB:
+  PROJECT: 'alzheimer-dual-classification-eval'
+  NAME: 'evaluation'
+  TAGS: ['evaluation', 'alzheimer', 'swin-admoe']
+
+# Other settings
+SEED: 42
+AMP_ENABLE: True
+LOCAL_RANK: 0
+TAG: 'evaluation'
+OUTPUT: './eval_output'
+SAVE_FREQ: 10
+PRINT_FREQ: 50
+EVAL_MODE: True  # Set to evaluation mode
+THROUGHPUT_MODE: False
+FUSED_WINDOW_PROCESS: False
+FUSED_LAYERNORM: False

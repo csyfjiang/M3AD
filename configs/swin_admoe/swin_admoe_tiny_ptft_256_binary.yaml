@@ -1,0 +1,181 @@
+DATA:
+  DATASET: 'alzheimer'
+  DATA_PATH: "Z:\\yufengjiang\\data\\prepare_external_val\\external_slices_for_pt_ft"
+  IMG_SIZE: 256
+  BATCH_SIZE: 32
+  BATCH_SIZE_PRETRAIN: 64
+  BATCH_SIZE_FINETUNE: 32
+  NUM_WORKERS: 4
+  PIN_MEMORY: True
+  INTERPOLATION: 'bicubic'
+
+MODEL:
+  TYPE: swin_single_task
+  NAME: swin_single_task_binary_patch4_window16_256
+  NUM_CLASSES: 2
+  DROP_RATE: 0.0
+  DROP_PATH_RATE: 0.1
+  LABEL_SMOOTHING: 0.1
+
+  SIMMIM:
+    MASK_RATIO: 0.6
+    NORM_TARGET:
+      ENABLE: True
+      PATCH_SIZE: 47
+
+  SWIN_SINGLE_TASK:
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 96
+    DEPTHS: [2, 2, 6, 2]
+    NUM_HEADS: [3, 6, 12, 24]
+    WINDOW_SIZE: 8
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [8, 8, 8, 4]
+    SHIFT_MLP_RATIO: 1.0
+    IS_PRETRAIN: True
+    USE_SHIFTED_LAST_LAYER: False
+
+    # Single task configuration
+    TASK_TYPE: 'binary'
+    NUM_CLASSES: 2
+    CLASS_NAMES: ['CN', 'AD']
+
+    # Clinical Prior Settings
+    USE_CLINICAL_PRIOR: True
+    PRIOR_DIM: 3
+    PRIOR_HIDDEN_DIM: 128
+    FUSION_STAGE: 2
+    FUSION_TYPE: 'adaptive'
+
+    # Expert Configuration
+    EXPERT_CONFIG:
+      AUTO_CONFIG: True
+      SHARED_EXPERT_WEIGHT: 0.4
+      SPECIFIC_EXPERT_WEIGHT: 0.6
+
+# Conservative augmentation for medical images
+AUG:
+  COLOR_JITTER: 0.0
+  AUTO_AUGMENT: 'none'
+  REPROB: 0.0
+  REMODE: 'pixel'
+  RECOUNT: 1
+  MIXUP: 0.0
+  CUTMIX: 0.0
+  CUTMIX_MINMAX: [0.3, 0.7]
+  MIXUP_PROB: 0.0
+  MIXUP_SWITCH_PROB: 0.5
+  MIXUP_MODE: 'batch'
+
+# Training settings
+TRAIN:
+  START_EPOCH: 0
+  EPOCHS: 150
+  PRETRAIN_EPOCHS: 0
+  BASE_LR: 1e-4
+  MIN_LR: 1e-6
+  WARMUP_EPOCHS: 10
+  WARMUP_LR: 1e-6
+  WEIGHT_DECAY: 0.05
+  CLIP_GRAD: 1.0
+  AUTO_RESUME: True
+  ACCUMULATION_STEPS: 1
+  USE_CHECKPOINT: False
+
+  OPTIMIZER:
+    NAME: 'adamw'
+    EPS: 1e-8
+    BETAS: [0.9, 0.999]
+    MOMENTUM: 0.9
+
+  LR_SCHEDULER:
+    NAME: 'cosine'
+    DECAY_EPOCHS: 30
+    DECAY_RATE: 0.1
+    WARMUP_PREFIX: True
+
+# Test settings
+TEST:
+  CROP: False
+  SEQUENTIAL: False
+  SHUFFLE: False
+
+# Single task specific settings
+SINGLE_TASK:
+  ENABLED: True
+  TASK_TYPE: 'binary'
+  NUM_CLASSES: 2
+  CLASS_NAMES: ['CN', 'AD']
+
+  BINARY:
+    ENABLED: True
+    POSITIVE_CLASS: 'AD'
+    NEGATIVE_CLASS: 'CN'
+
+  ANALYSIS:
+    LOG_EXPERT_WEIGHTS: True
+    EXPERT_ANALYSIS_INTERVAL: 25
+    SAVE_ATTENTION_MAPS: False
+
+  BENCHMARK:
+    ENABLED: True
+    DATASET: 'ADNI'
+    SPLIT: 'standard'
+    METRICS: ['accuracy', 'sensitivity', 'specificity', 'f1', 'auc']
+
+# Loss settings
+LOSS:
+  WEIGHT: 1.0
+
+# Evaluation settings
+EVAL:
+  INTERVAL: 5
+  SAVE_BEST: True
+  METRICS: ['accuracy', 'f1_score', 'confusion_matrix', 'auc', 'sensitivity', 'specificity']
+
+# Early stopping
+EARLY_STOP:
+  ENABLE: True
+  PATIENCE: 8
+  MONITOR: 'val_accuracy'
+
+# Mixed precision training
+AMP_ENABLE: True
+
+# Basic settings
+SEED: 42
+OUTPUT: './output/single_task_binary'
+TAG: 'binary_cn_vs_ad'
+SAVE_FREQ: 25
+PRINT_FREQ: 50
+EVAL_MODE: False
+THROUGHPUT_MODE: False
+LOCAL_RANK: 0
+
+# Distributed training
+FUSED_WINDOW_PROCESS: False
+FUSED_LAYERNORM: False
+
+# WandB settings
+WANDB:
+  PROJECT: 'alzheimer-single-task-binary'
+  NAME: 'swin_single_task_binary_cn_vs_ad'
+  TAGS: ['single_task', 'binary', 'cn_vs_ad', 'swin_moe']
+
+# Phase-specific configurations
+PHASES:
+  PRETRAIN:
+    DESCRIPTION: "SimMIM self-supervised pretraining with binary expert assignment"
+    LOSS_TYPE: "reconstruction"
+    EXPERT_ASSIGNMENT: "label_based"
+    EVALUATION_METRIC: "reconstruction_loss"
+
+  FINETUNE:
+    DESCRIPTION: "Binary classification finetuning (CN vs AD)"
+    LOSS_TYPE: "classification"
+    EXPERT_ASSIGNMENT: "learned_gating"
+    EVALUATION_METRIC: "classification_accuracy"

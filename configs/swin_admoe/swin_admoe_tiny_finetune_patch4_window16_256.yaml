@@ -1,0 +1,178 @@
+# Alzheimer's Disease Dual-Task Classification with TokenMLP/ShiftedBlock Configuration
+# Uses the improved version with ShiftedBlock in the last layer
+
+DATA:
+  DATASET: 'alzheimer'
+  DATA_PATH: '../data/slice'  # Windows path D://codebase//Swin-Transformer//examples Z://yufengjiang//data//slice data/external_slices_for_pt_ft ../data/slice
+  IMG_SIZE: 256
+  BATCH_SIZE: 6
+  NUM_WORKERS: 4
+  PIN_MEMORY: True
+  INTERPOLATION: 'bicubic'
+  # Phase-specific batch sizes
+#  BATCH_SIZE_PRETRAIN: 4  # Batch size for pretraining phase
+#  BATCH_SIZE_FINETUNE: 6  # Batch size for finetuning phase
+
+MODEL:
+  TYPE: swin_admoe  # Keep original type
+  NAME: swin_admoe_tokenmlp_tiny_patch4_window16_256
+  NUM_CLASSES: 3  # Keep for compatibility
+  DROP_RATE: 0.0
+  DROP_PATH_RATE: 0.1
+  LABEL_SMOOTHING: 0.1
+
+  # SimMIM Configuration
+  SIMMIM:
+    MASK_RATIO: 0.6  # Ratio of patches to mask
+    NORM_TARGET:
+      ENABLE: True   # Whether to normalize target
+      PATCH_SIZE: 47 # Patch size for target normalization
+
+  SWIN_ADMOE:
+    # Enable new version
+    USE_TOKENMLP_VERSION: True  # Key config: Enable TokenMLP version
+    USE_SHIFTED_LAST_LAYER: True  # Key config: Use ShiftedBlock in last layer
+    SHIFT_MLP_RATIO: 1.0  # MLP ratio for ShiftedBlock
+
+    # Dual-task class numbers
+    NUM_CLASSES_DIAGNOSIS: 3  # CN(1), MCI(2), Dementia(3) for 3 classes
+    NUM_CLASSES_CHANGE: 3     # Stable(1), Conversion(2), Reversion(3)
+
+    # Model architecture parameters
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 96
+    DEPTHS: [2, 2, 6, 2]
+    NUM_HEADS: [3, 6, 12, 24]
+    WINDOW_SIZE: 8
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [8, 8, 8, 4]
+    IS_PRETRAIN: True   # Start with pretraining mode
+
+    # Clinical Prior Settings
+    USE_CLINICAL_PRIOR: True
+    PRIOR_DIM: 3
+    PRIOR_HIDDEN_DIM: 128
+    FUSION_STAGE: 2      # Fusion after stage 2
+    FUSION_TYPE: 'adaptive'  # 'adaptive', 'concat', 'add', 'hadamard'
+
+# Data augmentation settings (conservative for medical images)
+AUG:
+  # Basic augmentation
+  COLOR_JITTER: 0.0  # Medical images don't need color jitter
+  AUTO_AUGMENT: 'rand-m5-mstd0.5-inc1'  # Options: 'rand-m5-mstd0.5-inc1', 'none'
+
+  # Random Erasing (disabled for medical images)
+  REPROB: 0.0
+  REMODE: 'pixel'
+  RECOUNT: 1
+
+  # Mixup/CutMix (disabled for medical images during pretraining)
+  MIXUP: 0.0
+  CUTMIX: 0.0
+  CUTMIX_MINMAX: [0.3,0.7]
+  MIXUP_PROB: 0.0
+  MIXUP_SWITCH_PROB: 0.5
+  MIXUP_MODE: 'batch'
+
+# Training settings
+TRAIN:
+  START_EPOCH: 0
+  EPOCHS: 200
+
+  # Phase-specific settings
+  PRETRAIN_EPOCHS: 0 # First 50 epochs for SimMIM pretraining
+
+  # Learning rate settings
+  BASE_LR: 1e-4         # Base learning rate
+  MIN_LR: 1e-6          # Minimum learning rate
+
+  # Warmup settings
+  WARMUP_EPOCHS: 10     # Warmup epochs
+  WARMUP_LR: 1e-6       # Warmup learning rate
+
+  # Weight decay and regularization
+  WEIGHT_DECAY: 0.05
+
+  # Gradient settings
+  CLIP_GRAD: 1.0
+  AUTO_RESUME: True
+  ACCUMULATION_STEPS: 1
+  USE_CHECKPOINT: False  # Set to True if GPU memory is insufficient
+
+  # Optimizer
+  OPTIMIZER:
+    NAME: 'adamw'
+    EPS: 1e-8
+    BETAS: [0.9, 0.999]
+    MOMENTUM: 0.9
+
+  # LR scheduler
+  LR_SCHEDULER:
+    NAME: 'cosine'
+    DECAY_EPOCHS: 30
+    DECAY_RATE: 0.1
+    WARMUP_PREFIX: True
+
+# Test settings
+TEST:
+  CROP: False
+  SEQUENTIAL: False
+  SHUFFLE: False
+
+# Mixed precision training
+AMP_ENABLE: True
+
+# Basic settings
+SEED: 42
+OUTPUT: './output/alzheimer_tokenmlp_dual_task'
+TAG: 'tokenmlp_shifted_v1'
+SAVE_FREQ: 20  # Save every 20 epochs
+PRINT_FREQ: 50
+EVAL_MODE: False
+THROUGHPUT_MODE: False
+LOCAL_RANK: 0
+
+# Distributed training
+FUSED_WINDOW_PROCESS: False
+FUSED_LAYERNORM: False
+
+# WandB settings
+WANDB:
+  PROJECT: 'alzheimer-tokenmlp-dual-classification'
+  NAME: 'swin_admoe_tokenmlp_shifted'
+  TAGS: ['tokenmlp', 'shifted', 'dual-task', 'alzheimer', 'swin-admoe', 'pretraining']
+
+# Loss weights (for finetuning phase)
+LOSS:
+  WEIGHT_DIAGNOSIS: 1.0  # Diagnosis task weight
+  WEIGHT_CHANGE: 1.0     # Change task weight
+
+# Evaluation settings
+EVAL:
+  INTERVAL: 25  # Validate every 25 epochs
+  SAVE_BEST: True
+  METRICS: ['accuracy', 'f1_score', 'confusion_matrix']
+
+# Early stopping settings
+EARLY_STOP:
+  ENABLE: True
+  PATIENCE: 5   # Increased patience for pretraining
+  MONITOR: 'val_loss'  # For pretraining: reconstruction loss, for finetuning: classification loss
+
+# Phase-specific configurations
+PHASES:
+  PRETRAIN:
+    DESCRIPTION: "SimMIM self-supervised pretraining with TokenMLP"
+    LOSS_TYPE: "reconstruction"
+    EXPERT_ASSIGNMENT: "label_based"  # Assign experts based on diagnosis labels
+    EVALUATION_METRIC: "reconstruction_loss"
+
+  FINETUNE:
+    DESCRIPTION: "Dual-task classification finetuning with ShiftedBlock"
+    LOSS_TYPE: "classification"
+    EXPERT_ASSIGNMENT: "learned_gating"  # Use learned adaptive gating
+    EVALUATION_METRIC: "classification_accuracy"
