@@ -3,7 +3,7 @@ Description:
 Author: JeffreyJ
 Date: 2025/7/14
 LastEditTime: 2025/7/14 12:56
-Version: 1.0
+Version: 2.0 - With 5-Fold Cross-Validation Support
 """
 """
 Description: 
@@ -15,7 +15,8 @@ Version: 2.0 - Nine Label Version
 # !/usr/bin/env python
 """
 Alzheimer's Disease Dual-Task Classification Training Script with SimMIM Pretraining
-Nine Label Version - 7 Change Classes
+Nine Label Version - 7 Change Classes - 5-Fold Cross-Validation with Majority Voting
+
 - Pretrain Phase: SimMIM reconstruction task
 - Finetune Phase: Dual classification tasks
   - Diagnosis Task: CN(1), MCI(2), Dementia(3)
@@ -27,6 +28,8 @@ Nine Label Version - 7 Change Classes
     5: Conversion MCI to AD
     6: Conversion CN to AD
     7: Reversion MCI to CN
+- 5-Fold Cross-Validation: Each fold trains independently, validation predictions
+  are accumulated across folds and a majority vote determines the final label.
 """
 
 import argparse
@@ -49,25 +52,25 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import warnings
 import logging
 
-# 配置警告过滤
+# Configure warning filters
 warnings.filterwarnings("ignore", message=".*Fused window process.*")
 warnings.filterwarnings("ignore", message=".*Tutel.*")
 
-# 降低某些模块的日志级别
+# Reduce logging level for certain modules
 logging.getLogger("models").setLevel(logging.ERROR)
 
-# 忽略 FutureWarning
+# Ignore FutureWarning
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# 或者更具体地忽略某些库的 FutureWarning
+# Ignore FutureWarnings from specific libraries
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
 warnings.filterwarnings("ignore", category=FutureWarning, module="numpy")
 warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
 
-# 如果想忽略 DeprecationWarning 也可以添加
+# Ignore DeprecationWarning
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# 忽略 UserWarning（比如 PyTorch 的一些提示）
+# Ignore UserWarning (e.g. PyTorch tips)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # pytorch major version (1.x or 2.x)
@@ -76,7 +79,7 @@ PYTORCH_MAJOR_VERSION = int(torch.__version__.split('.')[0])
 
 def parse_args():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser('Alzheimer Nine Label (7-Class Change) Training with SimMIM Pretraining')
+    parser = argparse.ArgumentParser('Alzheimer Nine Label (7-Class Change) Training with SimMIM Pretraining + 5-Fold CV')
 
     # Basic settings configs/swin_admoe/swin_admoe_tiny_nine_label_patch4_window16_256.yaml
     parser.add_argument('--cfg', type=str,
@@ -97,7 +100,7 @@ def parse_args():
 
     # Training settings
     parser.add_argument('--output', default='output', type=str, metavar='PATH',
-                        help='root of output folder, the full path is <output>/<model_name>/<tag>')
+                        help='root of output folder, the full path is <o>/<model_name>/<tag>')
     parser.add_argument('--tag', help='tag of experiment')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
     parser.add_argument('--seed', type=int, default=42, help='random seed')
@@ -161,6 +164,10 @@ def parse_args():
                         help='use ShiftedBlock in the last layer instead of BasicLayerMMoE')
     parser.add_argument('--shift-mlp-ratio', type=float, default=1.0,
                         help='MLP ratio for ShiftedBlock (default: 1.0)')
+
+    # Cross-validation settings
+    parser.add_argument('--n-folds', type=int, default=5,
+                        help='number of folds for cross-validation (default: 5)')
 
     args = parser.parse_args()
     return args
@@ -312,14 +319,14 @@ def prepare_config(args):
 
     # Set output directory
     config.defrost()
-    config.OUTPUT = args.output  # 只使用基础输出目录
+    config.OUTPUT = args.output  # Use base output directory only
     config.freeze()
 
     return config
 
 
 def log_change_label_distribution(train_loader, val_loader, logger):
-    """记录change label的分布情况"""
+    """Log change label distribution"""
     logger.info("\n" + "=" * 60)
     logger.info("CHANGE LABEL DISTRIBUTION ANALYSIS")
     logger.info("=" * 60)
@@ -357,7 +364,7 @@ def log_change_label_distribution(train_loader, val_loader, logger):
 
 
 def main():
-    """Main training function"""
+    """Main training function with 5-Fold Cross-Validation"""
     # Parse arguments
     args = parse_args()
 
@@ -452,11 +459,11 @@ def main():
         wandb_run_name=args.wandb_run_name or f"{config.MODEL.NAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         wandb_offline=args.wandb_offline,
 
-        # Warmup设置
+        # Warmup settings
         warmup_epochs=getattr(config.TRAIN, 'WARMUP_EPOCHS', 5),
         warmup_lr=getattr(config.TRAIN, 'WARMUP_LR', 1e-6),
 
-        # SimMIM预训练设置
+        # SimMIM pretraining settings
         pretrain_epochs=getattr(config.TRAIN, 'PRETRAIN_EPOCHS', config.TRAIN.EPOCHS // 2),
         mask_ratio=getattr(config.MODEL.SIMMIM, 'MASK_RATIO', 0.6),
         patch_size=getattr(config.MODEL.SWIN_ADMOE_NINE_LABEL, 'PATCH_SIZE', 4),
@@ -474,6 +481,9 @@ def main():
         rank=rank,
         world_size=world_size,
         local_rank=args.local_rank,
+
+        # Cross-validation settings
+        n_folds=args.n_folds,
     )
 
     # Add data-specific attributes
@@ -489,7 +499,7 @@ def main():
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         trainer_args.start_epoch = checkpoint['epoch'] + 1
 
-        # 检查是否有训练阶段信息
+        # Check if there's training phase info
         if 'phase' in checkpoint:
             logger.info(f"Resumed from {checkpoint['phase']} phase")
 
@@ -500,12 +510,11 @@ def main():
     # Evaluation only mode
     if args.eval:
         logger.info("Evaluation mode")
-        # TODO: Implement evaluation function for nine label version
         raise NotImplementedError("Evaluation mode not implemented yet for nine label version")
 
     # Log training plan
     logger.info("\n" + "=" * 60)
-    logger.info("TRAINING PLAN - NINE LABEL VERSION")
+    logger.info("TRAINING PLAN - NINE LABEL VERSION - 5-FOLD CROSS-VALIDATION")
     logger.info("=" * 60)
 
     pretrain_epochs = trainer_args.pretrain_epochs
@@ -518,19 +527,24 @@ def main():
     logger.info(f"  Change Classes: {trainer_args.num_classes_change} (7 detailed transition types)")
     logger.info(f"  Number of Experts: {config.MODEL.SWIN_ADMOE_NINE_LABEL.NUM_EXPERTS}")
 
+    # Log cross-validation settings
+    logger.info(f"\nCross-Validation Configuration:")
+    logger.info(f"  Number of Folds: {args.n_folds}")
+    logger.info(f"  Majority Voting: Enabled (accumulate predictions across validation folds)")
+
     if pretrain_epochs > 0:
-        logger.info(f"\nPhase 1 - SimMIM Pretraining:")
+        logger.info(f"\nPhase 1 - SimMIM Pretraining (per fold):")
         logger.info(f"  Epochs: 0 - {pretrain_epochs - 1} ({pretrain_epochs} epochs)")
         logger.info(f"  Task: Self-supervised reconstruction")
         logger.info(f"  Mask ratio: {trainer_args.mask_ratio}")
         logger.info(f"  Expert assignment: Based on diagnosis labels only")
 
-        logger.info(f"\nPhase 2 - Classification Finetuning:")
+        logger.info(f"\nPhase 2 - Classification Finetuning (per fold):")
         logger.info(f"  Epochs: {pretrain_epochs} - {total_epochs - 1} ({finetune_epochs} epochs)")
         logger.info(f"  Tasks: Diagnosis (3-class) + Change (7-class) classification")
         logger.info(f"  Expert gating: Learned adaptive gating")
     else:
-        logger.info(f"\nSingle Phase - Classification Training:")
+        logger.info(f"\nSingle Phase - Classification Training (per fold):")
         logger.info(f"  Epochs: 0 - {total_epochs - 1} ({total_epochs} epochs)")
         logger.info(f"  Tasks: Diagnosis (3-class) + Change (7-class) classification")
         logger.info(f"  Note: Skipping SimMIM pretraining")
@@ -553,10 +567,9 @@ def main():
     # Log data distribution if debug mode
     if config.DEBUG.CHECK_DATA_LOADING:
         logger.info("\nChecking data loading and label distribution...")
-        # This will be done inside the trainer after data loaders are created
 
-    # Start training
-    logger.info("Start training")
+    # Start training with 5-Fold Cross-Validation
+    logger.info("Start training with 5-Fold Cross-Validation and Majority Voting")
     trainer_alzheimer_mmoe_nine_label(trainer_args, model, config.OUTPUT)
 
 

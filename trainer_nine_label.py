@@ -2,15 +2,17 @@
 Description:
 Author: JeffreyJ
 Date: 2025/6/25
-LastEditTime: 2025/6/25 14:01
-Version: 2.0 - Nine Label Version
+LastEditTime: 2025/7/14
+Version: 3.0 - Nine Label Version with 5-Fold Cross-Validation and Majority Voting
 """
 """
-阿尔兹海默症双任务分类训练器 - MMoE版本 + SimMIM预训练 - 7分类Change Label版本
-- 预训练阶段：使用SimMIM进行自监督重建任务
-- 微调阶段：支持两个分类任务
+Alzheimer's Disease Dual-Task Classification Trainer - MMoE + SimMIM Pretraining - 7-Class Change Label
+With 5-Fold Cross-Validation and Majority Voting for Validation Predictions.
+
+- Pretrain Phase: SimMIM self-supervised reconstruction
+- Finetune Phase: Dual classification tasks
   - Diagnosis (1=CN, 2=MCI, 3=Dementia)
-  - Change Label (1-7: 细化的转换类型)
+  - Change Label (1-7: detailed transition types)
     1: Stable CN to CN
     2: Stable MCI to MCI  
     3: Stable AD to AD
@@ -18,16 +20,19 @@ Version: 2.0 - Nine Label Version
     5: Conversion MCI to AD
     6: Conversion CN to AD
     7: Reversion MCI to CN
-- 使用8专家MMoE架构，分别的门控网络
-- 使用wandb记录训练过程
-- 包含早停机制
-- 智能权重管理：预训练后自动移除decoder
+- 8-expert MMoE architecture with separate gating networks
+- wandb logging
+- Early stopping
+- Smart weight management: auto-remove decoder after pretraining
+- 5-Fold Cross-Validation with majority voting on accumulated predictions
 """
 import logging
 import os
 import random
 import sys
+import copy
 from typing import Tuple, Dict
+from collections import Counter, defaultdict
 
 import numpy as np
 import torch
@@ -35,8 +40,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.modules.loss import CrossEntropyLoss
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
+from sklearn.model_selection import KFold, StratifiedKFold
 from tqdm import tqdm
 import wandb
 import matplotlib.pyplot as plt
@@ -46,7 +52,7 @@ import math
 import logging
 from datetime import datetime
 
-# 假设您的数据加载器在这里
+# Data loader
 from data.data_ad_loader import build_loader_finetune
 
 
@@ -109,32 +115,37 @@ def validate_trainer_args(args):
     if num_change_classes not in [7]:  # Only support 7 change classes for nine label version
         raise ValueError(f"num_classes_change must be 7, got {num_change_classes}")
 
+    # Set default for n_folds if not specified
+    if not hasattr(args, 'n_folds'):
+        args.n_folds = 5
+        logging.info(f"n_folds not specified, using default: {args.n_folds}")
+
     logging.info("✓ Trainer arguments validation passed")
     return True
 
 
 def load_pretrained_weights(model, pretrained_path, exclude_decoder=True, logger=None):
     """
-    加载预训练权重，可选择排除decoder
+    Load pretrained weights with optional decoder exclusion.
 
     Args:
-        model: 要加载权重的模型
-        pretrained_path: 预训练权重路径
-        exclude_decoder: 是否排除decoder权重
-        logger: 日志记录器
+        model: Target model
+        pretrained_path: Path to pretrained weights
+        exclude_decoder: Whether to exclude decoder weights
+        logger: Logger instance
 
     Returns:
-        dict: 包含加载信息的字典
+        dict: Loading information
     """
     if logger is None:
         logger = logging.getLogger()
 
     logger.info(f"Loading pretrained weights from: {pretrained_path}")
 
-    # 加载checkpoint
+    # Load checkpoint
     checkpoint = torch.load(pretrained_path, map_location='cpu')
 
-    # 获取state_dict
+    # Get state_dict
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
         epoch_info = checkpoint.get('epoch', 'unknown')
@@ -147,7 +158,7 @@ def load_pretrained_weights(model, pretrained_path, exclude_decoder=True, logger
         state_dict = checkpoint
         logger.info("Loading state_dict directly")
 
-    # 统计原始权重
+    # Count original weights
     total_keys = len(state_dict)
     decoder_keys = [k for k in state_dict.keys() if k.startswith('decoder.')]
 
@@ -155,7 +166,7 @@ def load_pretrained_weights(model, pretrained_path, exclude_decoder=True, logger
     logger.info(f"Found {len(decoder_keys)} decoder parameters")
 
     if exclude_decoder and decoder_keys:
-        # 过滤掉decoder相关权重
+        # Filter out decoder weights
         filtered_state_dict = {
             k: v for k, v in state_dict.items()
             if not k.startswith('decoder.')
@@ -168,11 +179,11 @@ def load_pretrained_weights(model, pretrained_path, exclude_decoder=True, logger
         state_dict = filtered_state_dict
         logger.info(f"Filtered state_dict contains {len(state_dict)} parameters")
 
-    # 获取模型当前的参数
+    # Get current model parameters
     model_keys = set(model.state_dict().keys())
     checkpoint_keys = set(state_dict.keys())
 
-    # 分析匹配情况
+    # Analyze matching
     matched_keys = model_keys & checkpoint_keys
     missing_keys = model_keys - checkpoint_keys
     unexpected_keys = checkpoint_keys - model_keys
@@ -192,7 +203,7 @@ def load_pretrained_weights(model, pretrained_path, exclude_decoder=True, logger
         for key in sorted(unexpected_keys):
             logger.info(f"  - {key}")
 
-    # 加载权重，允许部分匹配
+    # Load weights with partial matching
     load_result = model.load_state_dict(state_dict, strict=False)
 
     logger.info(f"Weight loading completed!")
@@ -211,14 +222,14 @@ def load_pretrained_weights(model, pretrained_path, exclude_decoder=True, logger
 
 def remove_decoder_from_model(model, logger=None):
     """
-    从模型中移除decoder组件并记录详细信息
+    Remove decoder component from model with detailed logging.
 
     Args:
-        model: 要修改的模型
-        logger: 日志记录器
+        model: Model to modify
+        logger: Logger instance
 
     Returns:
-        dict: 包含移除信息的字典
+        dict: Removal information
     """
     if logger is None:
         logger = logging.getLogger()
@@ -227,16 +238,16 @@ def remove_decoder_from_model(model, logger=None):
     logger.info("REMOVING DECODER FROM MODEL")
     logger.info("=" * 60)
 
-    # 获取移除前的参数统计
+    # Get pre-removal parameter count
     total_params_before = sum(p.numel() for p in model.parameters())
     decoder_params = 0
     decoder_components = []
 
-    # 检查是否有decoder
+    # Check for decoder
     model_to_check = model.module if hasattr(model, 'module') else model
 
     if hasattr(model_to_check, 'decoder') and model_to_check.decoder is not None:
-        # 统计decoder参数
+        # Count decoder parameters
         for name, param in model_to_check.decoder.named_parameters():
             decoder_params += param.numel()
             decoder_components.append((name, param.shape, param.numel()))
@@ -247,13 +258,13 @@ def remove_decoder_from_model(model, logger=None):
 
         logger.info(f"Total decoder parameters: {decoder_params:,}")
 
-        # 移除decoder
+        # Remove decoder
         del model_to_check.decoder
         model_to_check.decoder = None
 
         logger.info("✓ Decoder successfully removed from model")
 
-        # 如果是DataParallel，需要重新包装
+        # Re-wrap with DataParallel if needed
         if hasattr(model, 'module'):
             logger.info("Re-wrapping model with DataParallel...")
             device_ids = list(range(torch.cuda.device_count()))
@@ -262,9 +273,9 @@ def remove_decoder_from_model(model, logger=None):
     else:
         logger.info("No decoder found in model or decoder already None")
 
-    # 获取移除后的参数统计
+    # Get post-removal parameter count
     total_params_after = sum(p.numel() for p in model.parameters())
-    memory_saved = decoder_params * 4 / (1024 ** 2)  # 假设float32，转换为MB
+    memory_saved = decoder_params * 4 / (1024 ** 2)  # Assuming float32, convert to MB
 
     logger.info(f"Parameter statistics:")
     logger.info(f"  - Before: {total_params_before:,} parameters")
@@ -286,12 +297,12 @@ def remove_decoder_from_model(model, logger=None):
 
 def log_model_components(model, phase="unknown", logger=None):
     """
-    记录模型组件的详细信息
+    Log detailed information about model components.
 
     Args:
-        model: 要分析的模型
-        phase: 当前阶段名称
-        logger: 日志记录器
+        model: Model to analyze
+        phase: Current phase name
+        logger: Logger instance
     """
     if logger is None:
         logger = logging.getLogger()
@@ -302,7 +313,7 @@ def log_model_components(model, phase="unknown", logger=None):
 
     model_to_check = model.module if hasattr(model, 'module') else model
 
-    # 统计各个组件的参数量
+    # Count parameters per component
     components = {}
 
     for name, module in model_to_check.named_children():
@@ -310,7 +321,7 @@ def log_model_components(model, phase="unknown", logger=None):
             param_count = sum(p.numel() for p in module.parameters())
             components[name] = param_count
 
-            # 特别标注重要组件
+            # Highlight important components
             if name in ['decoder', 'head_diagnosis', 'head_change', 'clinical_encoder', 'clinical_fusion']:
                 status = "✓ Active" if param_count > 0 else "✗ None/Empty"
                 logger.info(f"  {name:20}: {param_count:>10,} params {status}")
@@ -321,7 +332,7 @@ def log_model_components(model, phase="unknown", logger=None):
     logger.info(f"  {'=' * 40}")
     logger.info(f"  {'Total':20}: {total_params:>10,} params")
 
-    # 检查特定组件状态
+    # Check special component status
     special_components = ['decoder', 'head_diagnosis', 'head_change']
     logger.info(f"\nSpecial component status:")
     for comp in special_components:
@@ -342,14 +353,14 @@ def log_model_components(model, phase="unknown", logger=None):
 
 def generate_mask(input_size: Tuple[int, int], patch_size: int, mask_ratio: float,
                   device: torch.device) -> torch.Tensor:
-    """生成SimMIM的随机mask - patch级别的mask"""
+    """Generate random mask for SimMIM at patch level"""
     H, W = input_size
-    # 计算patch的数量
+    # Calculate number of patches
     h, w = H // patch_size, W // patch_size
     num_patches = h * w
     num_mask = int(num_patches * mask_ratio)
 
-    # 随机选择要mask的patches
+    # Randomly select patches to mask
     mask = torch.zeros(num_patches, dtype=torch.float32, device=device)
     mask_indices = torch.randperm(num_patches, device=device)[:num_mask]
     mask[mask_indices] = 1
@@ -358,7 +369,7 @@ def generate_mask(input_size: Tuple[int, int], patch_size: int, mask_ratio: floa
 
 
 def norm_targets(targets, patch_size):
-    """标准化目标 - from SimMIM"""
+    """Normalize targets - from SimMIM"""
     assert patch_size % 2 == 1
 
     targets_ = targets
@@ -383,13 +394,13 @@ def norm_targets(targets, patch_size):
 
 def create_data_loaders(config, phase='pretrain'):
     """
-    创建数据加载器，支持不同阶段使用不同的batch size
+    Create data loaders with phase-specific batch sizes.
 
     Args:
-        config: 配置对象
+        config: Configuration object
         phase: 'pretrain' or 'finetune'
     """
-    # 临时修改batch size
+    # Temporarily adjust batch size
     original_batch_size = config.DATA.BATCH_SIZE
 
     if phase == 'pretrain':
@@ -397,15 +408,15 @@ def create_data_loaders(config, phase='pretrain'):
     else:  # finetune
         batch_size = getattr(config.DATA, 'BATCH_SIZE_FINETUNE', config.DATA.BATCH_SIZE)
 
-    # 临时修改配置
+    # Temporarily modify config
     config.defrost()
     config.DATA.BATCH_SIZE = batch_size
     config.freeze()
 
-    # 创建数据加载器
+    # Create data loaders
     dataset_train, dataset_val, train_loader, val_loader, mixup_fn = build_loader_finetune(config)
 
-    # 恢复原始配置
+    # Restore original config
     config.defrost()
     config.DATA.BATCH_SIZE = original_batch_size
     config.freeze()
@@ -413,8 +424,54 @@ def create_data_loaders(config, phase='pretrain'):
     return dataset_train, dataset_val, train_loader, val_loader, mixup_fn
 
 
+def create_fold_data_loaders(dataset_train, train_indices, val_indices, config, phase='finetune'):
+    """
+    Create data loaders for a specific cross-validation fold using Subset.
+
+    Args:
+        dataset_train: Full training dataset
+        train_indices: Indices for training in this fold
+        val_indices: Indices for validation in this fold
+        config: Configuration object
+        phase: 'pretrain' or 'finetune'
+
+    Returns:
+        train_loader, val_loader for this fold
+    """
+    if phase == 'pretrain':
+        batch_size = getattr(config.DATA, 'BATCH_SIZE_PRETRAIN', config.DATA.BATCH_SIZE)
+    else:
+        batch_size = getattr(config.DATA, 'BATCH_SIZE_FINETUNE', config.DATA.BATCH_SIZE)
+
+    num_workers = getattr(config.DATA, 'NUM_WORKERS', 4)
+    pin_memory = getattr(config.DATA, 'PIN_MEMORY', True)
+
+    train_subset = Subset(dataset_train, train_indices)
+    val_subset = Subset(dataset_train, val_indices)
+
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=True
+    )
+
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False
+    )
+
+    return train_loader, val_loader
+
+
 class EarlyStopping:
-    """早停机制"""
+    """Early stopping mechanism"""
 
     def __init__(self, patience=5, verbose=True, delta=0):
         self.patience = patience
@@ -443,15 +500,14 @@ class EarlyStopping:
             self.counter = 0
 
     def save_checkpoint(self, val_loss, model, path):
-        '''保存模型当验证损失下降时'''
+        """Save model when validation loss decreases"""
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
 
-        # 保存时去除decoder（如果存在）
+        # Filter decoder weights when saving
         model_to_save = model.module if hasattr(model, 'module') else model
         state_dict = model_to_save.state_dict()
 
-        # 过滤decoder权重
         filtered_state_dict = {
             k: v for k, v in state_dict.items()
             if not k.startswith('decoder.')
@@ -460,9 +516,16 @@ class EarlyStopping:
         torch.save(filtered_state_dict, path)
         self.val_loss_min = val_loss
 
+    def reset(self):
+        """Reset early stopping state for a new fold"""
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+
 
 class SimMIMLoss(nn.Module):
-    """SimMIM重建损失"""
+    """SimMIM reconstruction loss"""
 
     def __init__(self, patch_size=4, norm_target=True, norm_target_patch_size=47):
         super().__init__()
@@ -473,29 +536,29 @@ class SimMIMLoss(nn.Module):
     def forward(self, input_images, reconstructed, mask):
         """
         Args:
-            input_images: 原始输入图像 [B, C, H, W]
-            reconstructed: 重建图像 [B, C, H, W]
-            mask: patch级别的mask [B, num_patches]
+            input_images: Original input images [B, C, H, W]
+            reconstructed: Reconstructed images [B, C, H, W]
+            mask: Patch-level mask [B, num_patches]
         """
         B, C, H, W = input_images.shape
 
-        # 将patch级别的mask转换为像素级别
+        # Convert patch-level mask to pixel-level
         h, w = H // self.patch_size, W // self.patch_size
         mask_reshaped = mask.reshape(B, h, w)
 
-        # 扩展mask到像素级别
+        # Expand mask to pixel level
         mask_upsampled = mask_reshaped.unsqueeze(-1).unsqueeze(-1)
         mask_upsampled = mask_upsampled.repeat(1, 1, 1, self.patch_size, self.patch_size)
         mask_upsampled = mask_upsampled.permute(0, 1, 3, 2, 4).contiguous()
         mask_upsampled = mask_upsampled.view(B, H, W)
         mask_upsampled = mask_upsampled.unsqueeze(1).repeat(1, C, 1, 1)
 
-        # 标准化目标（如果启用）
+        # Normalize target (if enabled)
         targets = input_images
         if self.norm_target:
             targets = norm_targets(targets, self.norm_target_patch_size)
 
-        # 计算重建损失（仅在masked区域）
+        # Compute reconstruction loss (only on masked regions)
         loss_recon = F.l1_loss(targets, reconstructed, reduction='none')
         loss = (loss_recon * mask_upsampled).sum() / (mask_upsampled.sum() + 1e-5) / C
 
@@ -503,7 +566,7 @@ class SimMIMLoss(nn.Module):
 
 
 class MultiTaskLoss(nn.Module):
-    """多任务损失函数 - MMoE版本 - 支持7分类change label"""
+    """Multi-task loss function - MMoE version - supports 7-class change label"""
 
     def __init__(self, weight_diagnosis=1.0, weight_change=1.0, label_smoothing=0.0,
                  num_diagnosis_classes=3, num_change_classes=7):
@@ -518,18 +581,18 @@ class MultiTaskLoss(nn.Module):
     def forward(self, outputs: Tuple[torch.Tensor, torch.Tensor],
                 diagnosis_labels: torch.Tensor, change_labels: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        计算两个任务的损失
-        注意：标签是1-based，需要转换为0-based
+        Compute losses for both tasks.
+        Note: Labels are 1-based, need to convert to 0-based.
         Returns:
-            包含total_loss, diagnosis_loss, change_loss的字典
+            Dict with total_loss, diagnosis_loss, change_loss
         """
         output_diagnosis, output_change = outputs
 
-        # 将标签从1-based转换为0-based
+        # Convert labels from 1-based to 0-based
         diagnosis_labels_zero_indexed = diagnosis_labels - 1
         change_labels_zero_indexed = change_labels - 1
 
-        # 确保标签在有效范围内
+        # Ensure labels are in valid range
         assert torch.all(diagnosis_labels_zero_indexed >= 0) and torch.all(
             diagnosis_labels_zero_indexed < self.num_diagnosis_classes), \
             f"Invalid diagnosis labels: {diagnosis_labels_zero_indexed}"
@@ -552,21 +615,21 @@ class MultiTaskLoss(nn.Module):
 def compute_metrics(outputs: Tuple[torch.Tensor, torch.Tensor],
                     diagnosis_labels: torch.Tensor, change_labels: torch.Tensor,
                     num_diagnosis_classes=3, num_change_classes=7) -> Dict[str, float]:
-    """计算评估指标 - MMoE版本 - 支持7分类"""
+    """Compute evaluation metrics - MMoE version - supports 7-class"""
     output_diagnosis, output_change = outputs
 
-    # 获取预测结果（预测的是0-based，需要转回1-based）
+    # Get predictions (0-based output, convert back to 1-based)
     pred_diagnosis = torch.argmax(output_diagnosis, dim=1).cpu().numpy() + 1
     pred_change = torch.argmax(output_change, dim=1).cpu().numpy() + 1
 
     diagnosis_labels_np = diagnosis_labels.cpu().numpy()
     change_labels_np = change_labels.cpu().numpy()
 
-    # 计算准确率
+    # Compute accuracy
     acc_diagnosis = accuracy_score(diagnosis_labels_np, pred_diagnosis)
     acc_change = accuracy_score(change_labels_np, pred_change)
 
-    # 计算F1分数
+    # Compute F1 scores
     diagnosis_labels_list = list(range(1, num_diagnosis_classes + 1))
     change_labels_list = list(range(1, num_change_classes + 1))
 
@@ -586,19 +649,19 @@ def compute_metrics(outputs: Tuple[torch.Tensor, torch.Tensor],
 
 
 def log_expert_utilization(model, val_loader, device, epoch, num_experts=8):
-    """记录专家利用率 - 用于分析MMoE的工作情况（支持clinical prior和8专家）"""
+    """Log expert utilization for analyzing MMoE behavior (supports clinical prior and 8 experts)"""
     model.eval()
     expert_weights_list = []
 
     with torch.no_grad():
-        # 只取一个batch进行分析
+        # Only analyze one batch
         batch = next(iter(val_loader))
         images = batch['image'].to(device)
         diagnosis_labels = batch['label'].to(device)
         change_labels = batch['change_label'].to(device)
         clinical_priors = batch['prior'].to(device)
 
-        # 获取专家利用率
+        # Get expert utilization
         try:
             expert_utilization = model.get_expert_utilization(
                 images,
@@ -608,13 +671,13 @@ def log_expert_utilization(model, val_loader, device, epoch, num_experts=8):
             )
 
             if expert_utilization:
-                # 计算平均专家权重
+                # Compute average expert weights
                 for layer_idx, gate_weights in enumerate(expert_utilization):
                     if 'diagnosis_weights' in gate_weights:
                         diagnosis_weights = gate_weights['diagnosis_weights'].mean(dim=[0, 1])  # [num_experts]
                         change_weights = gate_weights['change_weights'].mean(dim=[0, 1])  # [num_experts]
 
-                        # 记录到wandb - 8个专家
+                        # Log to wandb - 8 experts
                         expert_names = ['Shared1', 'Shared2', 'CN1', 'CN2', 'MCI1', 'MCI2', 'AD1', 'AD2']
                         for i, name in enumerate(expert_names):
                             wandb.log({
@@ -628,10 +691,10 @@ def log_expert_utilization(model, val_loader, device, epoch, num_experts=8):
 
 def train_one_epoch_pretrain(model, train_loader, criterion_simmim, optimizer, scheduler, device, epoch,
                              mask_ratio=0.6, patch_size=4, img_size=256, position=0):
-    """预训练一个epoch - SimMIM重建任务"""
+    """Pretrain one epoch - SimMIM reconstruction task"""
     model.train()
 
-    # 确保模型处于预训练模式
+    # Ensure model is in pretrain mode
     model_to_check = model.module if hasattr(model, 'module') else model
     model_to_check.is_pretrain = True
     for layer in model_to_check.layers:
@@ -649,7 +712,7 @@ def train_one_epoch_pretrain(model, train_loader, criterion_simmim, optimizer, s
     )
 
     for idx, batch in pbar:
-        # 获取数据
+        # Get data
         images = batch['image'].to(device)
         diagnosis_labels = batch['label'].to(device)
         change_labels = batch['change_label'].to(device)
@@ -657,34 +720,34 @@ def train_one_epoch_pretrain(model, train_loader, criterion_simmim, optimizer, s
 
         batch_size = images.shape[0]
 
-        # 生成mask
+        # Generate mask
         masks = torch.stack([
             generate_mask((img_size, img_size), patch_size, mask_ratio, device)
             for _ in range(batch_size)
         ])
 
-        # 前向传播 - SimMIM重建
+        # Forward pass - SimMIM reconstruction
         reconstructed = model(
             images,
             clinical_prior=clinical_priors,
-            lbls_diagnosis=diagnosis_labels - 1,  # 转换为0-based
+            lbls_diagnosis=diagnosis_labels - 1,  # Convert to 0-based
             lbls_change=change_labels - 1,
             mask=masks
         )
 
-        # 计算重建损失
+        # Compute reconstruction loss
         loss = criterion_simmim(images, reconstructed, masks)
 
-        # 反向传播
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         scheduler.step()
 
-        # 记录损失
+        # Record loss
         total_loss += loss.item()
 
-        # 更新进度条
+        # Update progress bar
         current_lr = optimizer.param_groups[0]['lr']
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
@@ -692,17 +755,17 @@ def train_one_epoch_pretrain(model, train_loader, criterion_simmim, optimizer, s
             'lr': f"{current_lr:.2e}"
         })
 
-    # 计算平均损失
+    # Compute average loss
     avg_loss = total_loss / len(train_loader)
     return avg_loss
 
 
 def train_one_epoch_finetune(model, train_loader, criterion, optimizer, scheduler, device, epoch,
                              use_timm_scheduler=False, position=0, num_diagnosis_classes=3, num_change_classes=7):
-    """微调一个epoch - 分类任务 - 支持7分类"""
+    """Finetune one epoch - classification tasks - supports 7-class"""
     model.train()
 
-    # 确保模型处于微调模式
+    # Ensure model is in finetune mode
     model_to_check = model.module if hasattr(model, 'module') else model
     model_to_check.is_pretrain = False
     for layer in model_to_check.layers:
@@ -722,13 +785,13 @@ def train_one_epoch_finetune(model, train_loader, criterion, optimizer, schedule
     )
 
     for idx, batch in pbar:
-        # 获取数据
+        # Get data
         images = batch['image'].to(device)
         diagnosis_labels = batch['label'].to(device)
         change_labels = batch['change_label'].to(device)
         clinical_priors = batch['prior'].to(device)
 
-        # 前向传播 - 分类任务
+        # Forward pass - classification
         outputs = model(
             images,
             clinical_prior=clinical_priors,
@@ -736,11 +799,11 @@ def train_one_epoch_finetune(model, train_loader, criterion, optimizer, schedule
             lbls_change=change_labels - 1
         )
 
-        # 计算损失
+        # Compute loss
         losses = criterion(outputs, diagnosis_labels, change_labels)
         loss = losses['total']
 
-        # 反向传播
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -748,18 +811,18 @@ def train_one_epoch_finetune(model, train_loader, criterion, optimizer, schedule
         if not use_timm_scheduler:
             scheduler.step()
 
-        # 记录损失
+        # Record losses
         total_loss += loss.item()
         total_diagnosis_loss += losses['diagnosis'].item()
         total_change_loss += losses['change'].item()
 
-        # 计算指标
+        # Compute metrics
         with torch.no_grad():
             metrics = compute_metrics(outputs, diagnosis_labels, change_labels,
                                       num_diagnosis_classes, num_change_classes)
             all_metrics.append(metrics)
 
-        # 更新进度条
+        # Update progress bar
         current_lr = optimizer.param_groups[0]['lr']
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
@@ -772,12 +835,12 @@ def train_one_epoch_finetune(model, train_loader, criterion, optimizer, schedule
     if use_timm_scheduler:
         scheduler.step(epoch)
 
-    # 计算平均值
+    # Compute averages
     avg_loss = total_loss / len(train_loader)
     avg_diagnosis_loss = total_diagnosis_loss / len(train_loader)
     avg_change_loss = total_change_loss / len(train_loader)
 
-    # 计算平均指标
+    # Compute average metrics
     avg_metrics = {}
     for key in all_metrics[0].keys():
         avg_metrics[key] = np.mean([m[key] for m in all_metrics])
@@ -788,10 +851,10 @@ def train_one_epoch_finetune(model, train_loader, criterion, optimizer, schedule
 @torch.no_grad()
 def validate_pretrain(model, val_loader, criterion_simmim, device, epoch,
                       mask_ratio=0.6, patch_size=4, img_size=256, position=2):
-    """预训练验证 - SimMIM重建任务"""
+    """Pretrain validation - SimMIM reconstruction task"""
     model.eval()
 
-    # 确保模型处于预训练模式
+    # Ensure model is in pretrain mode
     model_to_check = model.module if hasattr(model, 'module') else model
     model_to_check.is_pretrain = True
     for layer in model_to_check.layers:
@@ -808,7 +871,7 @@ def validate_pretrain(model, val_loader, criterion_simmim, device, epoch,
     )
 
     for idx, batch in pbar:
-        # 获取数据
+        # Get data
         images = batch['image'].to(device)
         diagnosis_labels = batch['label'].to(device)
         change_labels = batch['change_label'].to(device)
@@ -816,13 +879,13 @@ def validate_pretrain(model, val_loader, criterion_simmim, device, epoch,
 
         batch_size = images.shape[0]
 
-        # 生成mask
+        # Generate mask
         masks = torch.stack([
             generate_mask((img_size, img_size), patch_size, mask_ratio, device)
             for _ in range(batch_size)
         ])
 
-        # 前向传播
+        # Forward pass
         reconstructed = model(
             images,
             clinical_prior=clinical_priors,
@@ -831,11 +894,11 @@ def validate_pretrain(model, val_loader, criterion_simmim, device, epoch,
             mask=masks
         )
 
-        # 计算损失
+        # Compute loss
         loss = criterion_simmim(images, reconstructed, masks)
         total_loss += loss.item()
 
-        # 更新进度条
+        # Update progress bar
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
             'mask_ratio': f"{mask_ratio:.2f}"
@@ -848,10 +911,10 @@ def validate_pretrain(model, val_loader, criterion_simmim, device, epoch,
 @torch.no_grad()
 def validate_finetune(model, val_loader, criterion, device, epoch, position=2,
                       num_diagnosis_classes=3, num_change_classes=7):
-    """微调验证 - 分类任务 - 支持7分类"""
+    """Finetune validation - classification tasks - supports 7-class"""
     model.eval()
 
-    # 确保模型处于微调模式
+    # Ensure model is in finetune mode
     model_to_check = model.module if hasattr(model, 'module') else model
     model_to_check.is_pretrain = False
     for layer in model_to_check.layers:
@@ -868,6 +931,9 @@ def validate_finetune(model, val_loader, criterion, device, epoch, position=2,
     all_pred_change = []
     all_true_change = []
 
+    # For storing per-sample indices and predictions (used by majority voting)
+    all_sample_indices = []
+
     pbar = tqdm(
         enumerate(val_loader),
         total=len(val_loader),
@@ -877,13 +943,13 @@ def validate_finetune(model, val_loader, criterion, device, epoch, position=2,
     )
 
     for idx, batch in pbar:
-        # 获取数据
+        # Get data
         images = batch['image'].to(device)
         diagnosis_labels = batch['label'].to(device)
         change_labels = batch['change_label'].to(device)
         clinical_priors = batch['prior'].to(device)
 
-        # 前向传播
+        # Forward pass
         outputs = model(
             images,
             clinical_prior=clinical_priors,
@@ -891,20 +957,20 @@ def validate_finetune(model, val_loader, criterion, device, epoch, position=2,
             lbls_change=change_labels
         )
 
-        # 计算损失
+        # Compute loss
         losses = criterion(outputs, diagnosis_labels, change_labels)
 
-        # 记录损失
+        # Record losses
         total_loss += losses['total'].item()
         total_diagnosis_loss += losses['diagnosis'].item()
         total_change_loss += losses['change'].item()
 
-        # 计算指标
+        # Compute metrics
         metrics = compute_metrics(outputs, diagnosis_labels, change_labels,
                                   num_diagnosis_classes, num_change_classes)
         all_metrics.append(metrics)
 
-        # 收集预测结果
+        # Collect predictions
         output_diagnosis, output_change = outputs
         pred_diagnosis = torch.argmax(output_diagnosis, dim=1).cpu().numpy() + 1
         pred_change = torch.argmax(output_change, dim=1).cpu().numpy() + 1
@@ -914,23 +980,23 @@ def validate_finetune(model, val_loader, criterion, device, epoch, position=2,
         all_pred_change.extend(pred_change)
         all_true_change.extend(change_labels.cpu().numpy())
 
-        # 更新进度条
+        # Update progress bar
         pbar.set_postfix({
             'loss': f"{losses['total'].item():.4f}",
             'acc': f"{metrics['acc_avg']:.4f}"
         })
 
-    # 计算平均值
+    # Compute averages
     avg_loss = total_loss / len(val_loader)
     avg_diagnosis_loss = total_diagnosis_loss / len(val_loader)
     avg_change_loss = total_change_loss / len(val_loader)
 
-    # 计算平均指标
+    # Compute average metrics
     avg_metrics = {}
     for key in all_metrics[0].keys():
         avg_metrics[key] = np.mean([m[key] for m in all_metrics])
 
-    # 计算混淆矩阵
+    # Compute confusion matrices
     cm_diagnosis = confusion_matrix(all_true_diagnosis, all_pred_diagnosis,
                                     labels=list(range(1, num_diagnosis_classes + 1)))
     cm_change = confusion_matrix(all_true_change, all_pred_change,
@@ -940,11 +1006,73 @@ def validate_finetune(model, val_loader, criterion, device, epoch, position=2,
             all_true_diagnosis, all_pred_diagnosis, all_true_change, all_pred_change)
 
 
+def majority_vote(predictions_list):
+    """
+    Perform majority voting on a list of predictions for each sample.
+
+    Args:
+        predictions_list: list of prediction arrays, each of shape [num_samples_in_fold].
+                          This is a dict mapping sample_index -> list of predictions across folds.
+
+    Returns:
+        voted_predictions: dict mapping sample_index -> majority-voted label
+    """
+    voted = {}
+    for sample_idx, preds in predictions_list.items():
+        # Use Counter to find the most common prediction
+        counter = Counter(preds)
+        # most_common(1) returns [(element, count)]
+        voted[sample_idx] = counter.most_common(1)[0][0]
+    return voted
+
+
+def compute_majority_vote_metrics(sample_true_labels, sample_voted_preds,
+                                  num_classes, task_name=""):
+    """
+    Compute metrics from majority-voted predictions.
+
+    Args:
+        sample_true_labels: dict mapping sample_index -> true label
+        sample_voted_preds: dict mapping sample_index -> voted prediction
+        num_classes: number of classes
+        task_name: name of the task for logging
+
+    Returns:
+        dict with accuracy, f1, confusion_matrix
+    """
+    # Align indices
+    indices = sorted(sample_true_labels.keys())
+    true_labels = [sample_true_labels[i] for i in indices]
+    pred_labels = [sample_voted_preds[i] for i in indices]
+
+    labels_list = list(range(1, num_classes + 1))
+
+    acc = accuracy_score(true_labels, pred_labels)
+    f1 = f1_score(true_labels, pred_labels, labels=labels_list, average='weighted', zero_division=0)
+    cm = confusion_matrix(true_labels, pred_labels, labels=labels_list)
+
+    logging.info(f"\n{'=' * 50}")
+    logging.info(f"MAJORITY VOTE RESULTS - {task_name}")
+    logging.info(f"{'=' * 50}")
+    logging.info(f"Accuracy: {acc:.4f}")
+    logging.info(f"Weighted F1: {f1:.4f}")
+    logging.info(f"Total samples with votes: {len(indices)}")
+    logging.info(f"\nClassification Report:")
+    logging.info(classification_report(true_labels, pred_labels, labels=labels_list, zero_division=0))
+    logging.info(f"{'=' * 50}")
+
+    return {
+        'accuracy': acc,
+        'f1': f1,
+        'confusion_matrix': cm
+    }
+
+
 def create_detailed_confusion_matrix_plot(cm, labels, title, figsize=(10, 8)):
-    """创建详细的混淆矩阵图 - 支持7x7矩阵"""
+    """Create detailed confusion matrix plot - supports 7x7 matrix"""
     fig, ax = plt.subplots(figsize=figsize)
 
-    # 使用热力图
+    # Use heatmap
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=labels, yticklabels=labels,
                 square=True, cbar_kws={'label': 'Count'})
@@ -953,7 +1081,7 @@ def create_detailed_confusion_matrix_plot(cm, labels, title, figsize=(10, 8)):
     plt.xlabel('Predicted', fontsize=12)
     plt.ylabel('True', fontsize=12)
 
-    # 旋转标签以防重叠
+    # Rotate labels to prevent overlap
     plt.xticks(rotation=45, ha='right')
     plt.yticks(rotation=0)
 
@@ -961,8 +1089,30 @@ def create_detailed_confusion_matrix_plot(cm, labels, title, figsize=(10, 8)):
     return fig
 
 
+def get_dataset_labels(dataset):
+    """
+    Extract change_labels from dataset for stratified splitting.
+    Handles both raw datasets and Subset wrappers.
+
+    Args:
+        dataset: PyTorch Dataset
+
+    Returns:
+        numpy array of change labels
+    """
+    labels = []
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        labels.append(sample['change_label'] if isinstance(sample['change_label'], int)
+                      else sample['change_label'].item())
+    return np.array(labels)
+
+
 def trainer_alzheimer_mmoe_nine_label(args, model, snapshot_path):
-    """Alzheimer's disease dual-task trainer with MMoE main function - 支持SimMIM预训练 + 7分类change label"""
+    """
+    Alzheimer's disease dual-task trainer with MMoE - SimMIM pretraining + 7-class change label.
+    Now with 5-Fold Cross-Validation and majority voting on accumulated validation predictions.
+    """
 
     # Validate arguments early
     validate_trainer_args(args)
@@ -971,7 +1121,7 @@ def trainer_alzheimer_mmoe_nine_label(args, model, snapshot_path):
     if hasattr(args, 'MODEL') and hasattr(args.MODEL, 'NAME'):
         model_name = args.MODEL.NAME
 
-    # 添加时间戳和模型名称到快照路径
+    # Add timestamp and model name to snapshot path
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     snapshot_path = os.path.join(
         os.path.dirname(snapshot_path),
@@ -988,12 +1138,14 @@ def trainer_alzheimer_mmoe_nine_label(args, model, snapshot_path):
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(str(args))
 
-    # 获取类别数量
+    # Get class counts
     num_diagnosis_classes = getattr(args, 'num_classes_diagnosis', 3)
     num_change_classes = getattr(args, 'num_classes_change', 7)
+    n_folds = getattr(args, 'n_folds', 5)
 
     logging.info(f"Number of diagnosis classes: {num_diagnosis_classes}")
     logging.info(f"Number of change classes: {num_change_classes}")
+    logging.info(f"Number of cross-validation folds: {n_folds}")
 
     # Initialize wandb
     wandb_name = getattr(args, 'wandb_run_name', getattr(args, 'exp_name', 'alzheimer_mmoe_nine_label_run'))
@@ -1017,43 +1169,14 @@ def trainer_alzheimer_mmoe_nine_label(args, model, snapshot_path):
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
 
-    # ============== Training parameters - Define early ==============
+    # ============== Training parameters ==============
     start_epoch = getattr(args, 'start_epoch', 0)
     resume_path = getattr(args, 'resume', None)
     pretrained_path = getattr(args, 'pretrained', None)
-    best_val_acc = 0
     pretrain_epochs = getattr(args, 'pretrain_epochs', args.max_epochs // 2)
 
-    # ============== 权重加载逻辑 ==============
-    if resume_path:
-        # 从中断点恢复训练
-        logging.info("Resuming training from checkpoint...")
-        load_info = load_pretrained_weights(model, resume_path, exclude_decoder=False, logger=logging.getLogger())
-
-        # 从checkpoint中获取epoch信息
-        checkpoint = torch.load(resume_path, map_location='cpu')
-        start_epoch = checkpoint.get('epoch', 0) + 1
-        logging.info(f"Resumed from epoch {start_epoch}")
-
-    elif pretrained_path:
-        # 加载预训练权重（排除decoder）
-        logging.info("Loading pretrained weights (excluding decoder)...")
-        load_info = load_pretrained_weights(model, pretrained_path, exclude_decoder=True, logger=logging.getLogger())
-
-        # 记录权重加载信息到wandb
-        wandb.log({
-            'weight_loading/total_keys': load_info['total_keys'],
-            'weight_loading/loaded_keys': load_info['loaded_keys'],
-            'weight_loading/missing_keys': load_info['missing_keys'],
-            'weight_loading/excluded_decoder': load_info['excluded_decoder']
-        })
-
-    # 记录初始模型组件
-    log_model_components(model, "Initial", logging.getLogger())
-
-    # Data loader
+    # Data loader config
     logging.info("Loading data...")
     if hasattr(args, 'config'):
         config = args.config
@@ -1063,82 +1186,51 @@ def trainer_alzheimer_mmoe_nine_label(args, model, snapshot_path):
         config = type('Config', (), {})()
         config.DATA = args.DATA if hasattr(args, 'DATA') else args
 
-    # 获取阶段特定的batch size
+    # Get phase-specific batch sizes
     batch_size_pretrain = getattr(config.DATA, 'BATCH_SIZE_PRETRAIN', config.DATA.BATCH_SIZE)
     batch_size_finetune = getattr(config.DATA, 'BATCH_SIZE_FINETUNE', config.DATA.BATCH_SIZE)
 
     logging.info(f"Batch sizes - Pretrain: {batch_size_pretrain}, Finetune: {batch_size_finetune}")
 
-    # 初始创建数据加载器（预训练阶段）
-    current_phase = 'pretrain' if pretrain_epochs > 0 else 'finetune'
-    dataset_train, dataset_val, train_loader, val_loader, mixup_fn = create_data_loaders(config, current_phase)
-    logging.info(f"Train set size: {len(dataset_train)}, Val set size: {len(dataset_val)}")
-    logging.info(f"Initial data loaders created for {current_phase} phase")
-
-    # Multi-GPU support
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-        logging.info(f"Using {torch.cuda.device_count()} GPUs")
-
-    # 损失函数
-    # SimMIM损失（预训练）
-    criterion_simmim = SimMIMLoss(
-        patch_size=getattr(args, 'patch_size', 4),
-        norm_target=getattr(args, 'norm_target', True),
-        norm_target_patch_size=getattr(args, 'norm_target_patch_size', 47)
+    # ============== Load the FULL training dataset (used for CV splitting) ==============
+    # We load the full dataset once; cross-validation splits will be done on indices.
+    dataset_train, dataset_val_unused, full_train_loader, full_val_loader, mixup_fn = create_data_loaders(
+        config, 'finetune'
     )
+    logging.info(f"Full training set size: {len(dataset_train)}")
 
-    # 分类损失（微调）- 支持7分类
-    criterion_classification = MultiTaskLoss(
-        weight_diagnosis=getattr(args, 'weight_diagnosis', 1.0),
-        weight_change=getattr(args, 'weight_change', 1.0),
-        label_smoothing=getattr(args, 'label_smoothing', 0.0),
-        num_diagnosis_classes=num_diagnosis_classes,
-        num_change_classes=num_change_classes
-    )
+    # Save initial model state for resetting at each fold
+    initial_model_state = copy.deepcopy(model.state_dict())
 
-    # Optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.base_lr,
-        weight_decay=args.weight_decay
-    )
+    # ============== Extract labels for stratified splitting ==============
+    logging.info("Extracting labels for stratified cross-validation split...")
+    try:
+        all_change_labels = get_dataset_labels(dataset_train)
+        logging.info(f"Successfully extracted {len(all_change_labels)} labels for stratification")
+        use_stratified = True
+    except Exception as e:
+        logging.warning(f"Failed to extract labels for stratification: {e}. Using standard KFold instead.")
+        use_stratified = False
 
-    # 如果是resume，加载optimizer状态
-    if resume_path:
-        checkpoint = torch.load(resume_path, map_location='cpu')
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            logging.info("Optimizer state loaded from checkpoint")
+    # ============== Setup K-Fold Cross-Validation ==============
+    if use_stratified:
+        kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(kfold.split(np.arange(len(dataset_train)), all_change_labels))
+    else:
+        kfold = KFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(kfold.split(np.arange(len(dataset_train))))
 
-    # Scheduler
-    warmup_epochs = getattr(args, 'warmup_epochs', 5)
-    num_steps_per_epoch = len(train_loader)
-    total_steps = num_steps_per_epoch * args.max_epochs
-    warmup_steps = num_steps_per_epoch * warmup_epochs
+    # ============== Majority voting accumulators ==============
+    # Maps: sample_index -> list of predictions from each fold where it was in validation
+    diagnosis_predictions_per_sample = defaultdict(list)
+    change_predictions_per_sample = defaultdict(list)
+    # Maps: sample_index -> true label (should be consistent)
+    diagnosis_true_per_sample = {}
+    change_true_per_sample = {}
 
-    from torch.optim.lr_scheduler import LambdaLR
-
-    def lr_lambda(current_step):
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-    scheduler = LambdaLR(optimizer, lr_lambda)
-
-    # 如果是resume，加载scheduler状态
-    if resume_path:
-        checkpoint = torch.load(resume_path, map_location='cpu')
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            logging.info("Scheduler state loaded from checkpoint")
-
-    logging.info(f"Using cosine scheduler with warmup")
-    logging.info(f"Warmup epochs: {warmup_epochs}, Base LR: {args.base_lr}")
-
-    # Early stopping
-    early_stopping = EarlyStopping(patience=args.patience, verbose=True)
+    # Track per-fold best metrics
+    fold_best_accs = []
+    fold_best_f1s = []
 
     # SimMIM parameters
     mask_ratio = getattr(args, 'mask_ratio', 0.6)
@@ -1155,334 +1247,531 @@ def trainer_alzheimer_mmoe_nine_label(args, model, snapshot_path):
         'Conv CN→AD',
         'Rev MCI→CN'
     ]
-
     diagnosis_names = ['CN', 'MCI', 'AD']
 
-    logging.info(f"Training plan:")
-    logging.info(f"- Total epochs: {args.max_epochs}")
+    logging.info(f"\nTraining plan (5-Fold Cross-Validation):")
+    logging.info(f"- Total epochs per fold: {args.max_epochs}")
     logging.info(f"- Pretraining epochs: {pretrain_epochs} (SimMIM reconstruction)")
     logging.info(f"- Finetuning epochs: {args.max_epochs - pretrain_epochs} (Classification)")
+    logging.info(f"- Number of folds: {n_folds}")
     logging.info(f"- SimMIM mask ratio: {mask_ratio}")
-    logging.info(f"- Batch sizes:")
-    logging.info(f"  - Pretrain: {batch_size_pretrain}")
-    logging.info(f"  - Finetune: {batch_size_finetune}")
-    logging.info(f"- Starting from epoch: {start_epoch}")
     logging.info(f"- Change labels: {change_label_names}")
 
-    overall_pbar = tqdm(
-        total=args.max_epochs - start_epoch,
-        desc="Overall Training Progress",
-        position=0,
-        leave=True,
-        bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} epochs [{elapsed}<{remaining}, {rate_fmt}]'
-    )
+    # ============== CROSS-VALIDATION LOOP ==============
+    for fold_idx, (train_indices, val_indices) in enumerate(fold_splits):
+        logging.info(f"\n{'#' * 80}")
+        logging.info(f"# FOLD {fold_idx + 1}/{n_folds}")
+        logging.info(f"# Train samples: {len(train_indices)}, Val samples: {len(val_indices)}")
+        logging.info(f"{'#' * 80}")
 
-    # 标记是否已经进行了decoder移除
-    decoder_removed = False
+        # Create fold-specific output directory
+        fold_snapshot_path = os.path.join(snapshot_path, f'fold_{fold_idx + 1}')
+        os.makedirs(fold_snapshot_path, exist_ok=True)
 
-    for epoch in range(start_epoch, args.max_epochs):
-        logging.info(f"\n{'=' * 50}")
-        logging.info(f"Epoch {epoch}/{args.max_epochs - 1}")
+        # ============== Reset model to initial state for each fold ==============
+        model.load_state_dict(copy.deepcopy(initial_model_state))
+        model = model.to(device)
 
-        current_lr = optimizer.param_groups[0]['lr']
-        logging.info(f"Learning rate: {current_lr:.6f}")
-
-        is_pretrain = epoch < pretrain_epochs
-        phase = "Pretrain (SimMIM)" if is_pretrain else "Finetune (Classification)"
-        logging.info(f"Phase: {phase}")
-
-        # ============== 阶段切换逻辑 ==============
-        if not is_pretrain and not decoder_removed:
-            # 从预训练切换到微调：移除decoder
-            logging.info("\n" + "=" * 80)
-            logging.info("SWITCHING FROM PRETRAINING TO FINETUNING")
-            logging.info("=" * 80)
-
-            # 移除decoder
-            remove_info = remove_decoder_from_model(model, logging.getLogger())
-            decoder_removed = True
-
-            # 记录移除信息到wandb
-            wandb.log({
-                'model_modification/decoder_removed': remove_info['removed'],
-                'model_modification/decoder_params_removed': remove_info['decoder_params'],
-                'model_modification/memory_saved_mb': remove_info['memory_saved_mb'],
-                'model_modification/params_after_removal': remove_info['params_after'],
-                'epoch': epoch
-            })
-
-            # 重新创建数据加载器（使用微调阶段的batch size）
-            logging.info("Recreating data loaders for finetuning phase...")
-            dataset_train, dataset_val, train_loader, val_loader, mixup_fn = create_data_loaders(config, 'finetune')
-            num_steps_per_epoch = len(train_loader)  # 更新步数
-            logging.info(f"✓ Data loaders recreated with batch size: {batch_size_finetune}")
-
-            # 重新创建optimizer（因为参数可能发生变化）
-            logging.info("Recreating optimizer for remaining parameters...")
-            optimizer = optim.AdamW(
-                model.parameters(),
-                lr=args.base_lr,
-                weight_decay=args.weight_decay
-            )
-
-            # 重新创建scheduler
-            remaining_steps = num_steps_per_epoch * (args.max_epochs - epoch)
-            remaining_warmup = max(0, warmup_steps - epoch * num_steps_per_epoch)
-
-            def new_lr_lambda(current_step):
-                if current_step < remaining_warmup:
-                    return float(current_step) / float(max(1, remaining_warmup))
-                progress = float(current_step - remaining_warmup) / float(max(1, remaining_steps - remaining_warmup))
-                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-            scheduler = LambdaLR(optimizer, new_lr_lambda)
-
-            logging.info("✓ Optimizer and scheduler recreated for finetuning phase")
-
-            # 记录切换后的模型组件
-            log_model_components(model, "After Decoder Removal", logging.getLogger())
-
-        if is_pretrain:
-            # ===== 预训练阶段：SimMIM重建 =====
-            train_loss = train_one_epoch_pretrain(
-                model, train_loader, criterion_simmim, optimizer, scheduler, device, epoch,
-                mask_ratio=mask_ratio, patch_size=patch_size, img_size=img_size, position=1
-            )
-
-            # Log training metrics
-            wandb.log({
-                'train/loss_simmim': train_loss,
-                'train/lr': current_lr,
-                'train/phase': 1,  # 1 for pretrain
-                'train/mask_ratio': mask_ratio,
-                'epoch': epoch
-            })
-
-            logging.info(f"Pretrain - SimMIM Loss: {train_loss:.4f}")
-
-            # Validation (every eval_interval epochs)
-            if (epoch + 1) % args.eval_interval == 0:
-                val_loss = validate_pretrain(
-                    model, val_loader, criterion_simmim, device, epoch,
-                    mask_ratio=mask_ratio, patch_size=patch_size, img_size=img_size
-                )
-
-                wandb.log({
-                    'val/loss_simmim': val_loss,
-                    'val/phase': 1,  # 1 for pretrain
-                    'epoch': epoch
-                })
-
-                logging.info(f"Pretrain Val - SimMIM Loss: {val_loss:.4f}")
-
-                # Early stopping based on reconstruction loss
-                early_stopping(val_loss, model, os.path.join(snapshot_path, 'pretrain_checkpoint.pth'))
-                if early_stopping.early_stop:
-                    logging.info("Early stopping triggered during pretraining!")
-                    break
-
+        # ============== Weight loading logic (per fold) ==============
+        if resume_path:
+            logging.info(f"[Fold {fold_idx+1}] Resuming training from checkpoint...")
+            load_info = load_pretrained_weights(model, resume_path, exclude_decoder=False, logger=logging.getLogger())
+            checkpoint = torch.load(resume_path, map_location='cpu')
+            fold_start_epoch = checkpoint.get('epoch', 0) + 1
+            logging.info(f"[Fold {fold_idx+1}] Resumed from epoch {fold_start_epoch}")
+        elif pretrained_path:
+            logging.info(f"[Fold {fold_idx+1}] Loading pretrained weights (excluding decoder)...")
+            load_info = load_pretrained_weights(model, pretrained_path, exclude_decoder=True, logger=logging.getLogger())
+            fold_start_epoch = start_epoch
         else:
-            # ===== 微调阶段：分类任务 =====
-            train_loss, train_diagnosis_loss, train_change_loss, train_metrics = train_one_epoch_finetune(
-                model, train_loader, criterion_classification, optimizer, scheduler, device, epoch,
-                use_timm_scheduler=False, position=1,
-                num_diagnosis_classes=num_diagnosis_classes,
-                num_change_classes=num_change_classes
-            )
+            fold_start_epoch = start_epoch
 
-            # Log training metrics
-            wandb.log({
-                'train/loss': train_loss,
-                'train/loss_diagnosis': train_diagnosis_loss,
-                'train/loss_change': train_change_loss,
-                'train/acc_diagnosis': train_metrics['acc_diagnosis'],
-                'train/acc_change': train_metrics['acc_change'],
-                'train/acc_avg': train_metrics['acc_avg'],
-                'train/f1_diagnosis': train_metrics['f1_diagnosis'],
-                'train/f1_change': train_metrics['f1_change'],
-                'train/f1_avg': train_metrics['f1_avg'],
-                'train/lr': current_lr,
-                'train/phase': 0,  # 0 for finetune
-                'epoch': epoch
-            })
+        # Log initial model components
+        log_model_components(model, f"Fold {fold_idx+1} Initial", logging.getLogger())
 
-            logging.info(f"Finetune - Loss: {train_loss:.4f}, Acc: {train_metrics['acc_avg']:.4f}")
+        # Multi-GPU support
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+            logging.info(f"Using {torch.cuda.device_count()} GPUs")
 
-            # Validation (every eval_interval epochs)
-            if (epoch + 1) % args.eval_interval == 0:
-                val_results = validate_finetune(model, val_loader, criterion_classification, device, epoch,
-                                                num_diagnosis_classes=num_diagnosis_classes,
-                                                num_change_classes=num_change_classes)
+        # ============== Create fold-specific data loaders ==============
+        current_phase = 'pretrain' if pretrain_epochs > 0 else 'finetune'
+        train_loader, val_loader = create_fold_data_loaders(
+            dataset_train, train_indices, val_indices, config, current_phase
+        )
+        logging.info(f"[Fold {fold_idx+1}] Created data loaders - Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-                if len(val_results) == 6:
-                    val_loss, val_diagnosis_loss, val_change_loss, val_metrics, cm_diagnosis, cm_change = val_results
-                    all_true_diagnosis, all_pred_diagnosis, all_true_change, all_pred_change = None, None, None, None
-                else:
-                    val_loss, val_diagnosis_loss, val_change_loss, val_metrics, cm_diagnosis, cm_change, \
-                        all_true_diagnosis, all_pred_diagnosis, all_true_change, all_pred_change = val_results
+        # ============== Loss functions ==============
+        # SimMIM loss (pretraining)
+        criterion_simmim = SimMIMLoss(
+            patch_size=getattr(args, 'patch_size', 4),
+            norm_target=getattr(args, 'norm_target', True),
+            norm_target_patch_size=getattr(args, 'norm_target_patch_size', 47)
+        )
 
-                # Log validation metrics
+        # Classification loss (finetuning) - 7-class
+        criterion_classification = MultiTaskLoss(
+            weight_diagnosis=getattr(args, 'weight_diagnosis', 1.0),
+            weight_change=getattr(args, 'weight_change', 1.0),
+            label_smoothing=getattr(args, 'label_smoothing', 0.0),
+            num_diagnosis_classes=num_diagnosis_classes,
+            num_change_classes=num_change_classes
+        )
+
+        # ============== Optimizer ==============
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=args.base_lr,
+            weight_decay=args.weight_decay
+        )
+
+        # ============== Scheduler ==============
+        warmup_epochs = getattr(args, 'warmup_epochs', 5)
+        num_steps_per_epoch = len(train_loader)
+        total_steps = num_steps_per_epoch * args.max_epochs
+        warmup_steps = num_steps_per_epoch * warmup_epochs
+
+        from torch.optim.lr_scheduler import LambdaLR
+
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        scheduler = LambdaLR(optimizer, lr_lambda)
+
+        logging.info(f"[Fold {fold_idx+1}] Using cosine scheduler with warmup")
+        logging.info(f"[Fold {fold_idx+1}] Warmup epochs: {warmup_epochs}, Base LR: {args.base_lr}")
+
+        # Early stopping (reset per fold)
+        early_stopping = EarlyStopping(patience=args.patience, verbose=True)
+
+        # Track best val accuracy for this fold
+        best_val_acc = 0
+        decoder_removed = False
+
+        overall_pbar = tqdm(
+            total=args.max_epochs - fold_start_epoch,
+            desc=f"Fold {fold_idx+1}/{n_folds} Progress",
+            position=0,
+            leave=True,
+            bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} epochs [{elapsed}<{remaining}, {rate_fmt}]'
+        )
+
+        for epoch in range(fold_start_epoch, args.max_epochs):
+            logging.info(f"\n{'=' * 50}")
+            logging.info(f"[Fold {fold_idx+1}] Epoch {epoch}/{args.max_epochs - 1}")
+
+            current_lr = optimizer.param_groups[0]['lr']
+            logging.info(f"Learning rate: {current_lr:.6f}")
+
+            is_pretrain = epoch < pretrain_epochs
+            phase = "Pretrain (SimMIM)" if is_pretrain else "Finetune (Classification)"
+            logging.info(f"Phase: {phase}")
+
+            # ============== Phase switch logic ==============
+            if not is_pretrain and not decoder_removed:
+                logging.info(f"\n[Fold {fold_idx+1}] SWITCHING FROM PRETRAINING TO FINETUNING")
+
+                # Remove decoder
+                remove_info = remove_decoder_from_model(model, logging.getLogger())
+                decoder_removed = True
+
+                # Log removal info to wandb
                 wandb.log({
-                    'val/loss': val_loss,
-                    'val/loss_diagnosis': val_diagnosis_loss,
-                    'val/loss_change': val_change_loss,
-                    'val/acc_diagnosis': val_metrics['acc_diagnosis'],
-                    'val/acc_change': val_metrics['acc_change'],
-                    'val/acc_avg': val_metrics['acc_avg'],
-                    'val/f1_diagnosis': val_metrics['f1_diagnosis'],
-                    'val/f1_change': val_metrics['f1_change'],
-                    'val/f1_avg': val_metrics['f1_avg'],
-                    'val/phase': 0,  # 0 for finetune
+                    f'fold_{fold_idx+1}/model_modification/decoder_removed': remove_info['removed'],
+                    f'fold_{fold_idx+1}/model_modification/decoder_params_removed': remove_info['decoder_params'],
+                    f'fold_{fold_idx+1}/model_modification/memory_saved_mb': remove_info['memory_saved_mb'],
                     'epoch': epoch
                 })
 
-                # Log expert utilization (only during finetuning)
-                log_expert_utilization(model, val_loader, device, epoch, num_experts=8)
+                # Recreate data loaders for finetuning phase
+                logging.info(f"[Fold {fold_idx+1}] Recreating data loaders for finetuning phase...")
+                train_loader, val_loader = create_fold_data_loaders(
+                    dataset_train, train_indices, val_indices, config, 'finetune'
+                )
+                num_steps_per_epoch = len(train_loader)
+                logging.info(f"[Fold {fold_idx+1}] Data loaders recreated with batch size: {batch_size_finetune}")
 
-                # Log confusion matrices
-                # Diagnosis confusion matrix (3x3)
-                fig_cm_diagnosis = create_detailed_confusion_matrix_plot(
-                    cm_diagnosis, diagnosis_names,
-                    'Confusion Matrix - Diagnosis (3 classes)',
-                    figsize=(8, 6)
+                # Recreate optimizer (parameters may have changed)
+                optimizer = optim.AdamW(
+                    model.parameters(),
+                    lr=args.base_lr,
+                    weight_decay=args.weight_decay
                 )
 
-                # Change confusion matrix (7x7)
-                fig_cm_change = create_detailed_confusion_matrix_plot(
-                    cm_change, change_label_names,
-                    'Confusion Matrix - Change Label (7 classes)',
-                    figsize=(12, 10)
+                # Recreate scheduler
+                remaining_steps = num_steps_per_epoch * (args.max_epochs - epoch)
+                remaining_warmup = max(0, warmup_steps - epoch * num_steps_per_epoch)
+
+                def new_lr_lambda(current_step):
+                    if current_step < remaining_warmup:
+                        return float(current_step) / float(max(1, remaining_warmup))
+                    progress = float(current_step - remaining_warmup) / float(
+                        max(1, remaining_steps - remaining_warmup))
+                    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+                scheduler = LambdaLR(optimizer, new_lr_lambda)
+
+                logging.info(f"[Fold {fold_idx+1}] Optimizer and scheduler recreated for finetuning phase")
+                log_model_components(model, f"Fold {fold_idx+1} After Decoder Removal", logging.getLogger())
+
+            if is_pretrain:
+                # ===== Pretrain phase: SimMIM reconstruction =====
+                train_loss = train_one_epoch_pretrain(
+                    model, train_loader, criterion_simmim, optimizer, scheduler, device, epoch,
+                    mask_ratio=mask_ratio, patch_size=patch_size, img_size=img_size, position=1
                 )
 
+                # Log training metrics
                 wandb.log({
-                    'val/confusion_matrix_diagnosis': wandb.Image(fig_cm_diagnosis),
-                    'val/confusion_matrix_change': wandb.Image(fig_cm_change),
+                    f'fold_{fold_idx+1}/train/loss_simmim': train_loss,
+                    f'fold_{fold_idx+1}/train/lr': current_lr,
+                    f'fold_{fold_idx+1}/train/phase': 1,
                     'epoch': epoch
                 })
 
-                plt.close(fig_cm_diagnosis)
-                plt.close(fig_cm_change)
+                logging.info(f"[Fold {fold_idx+1}] Pretrain - SimMIM Loss: {train_loss:.4f}")
 
-                logging.info(f"Finetune Val - Loss: {val_loss:.4f}, Acc: {val_metrics['acc_avg']:.4f}")
+                # Validation (every eval_interval epochs)
+                if (epoch + 1) % args.eval_interval == 0:
+                    val_loss = validate_pretrain(
+                        model, val_loader, criterion_simmim, device, epoch,
+                        mask_ratio=mask_ratio, patch_size=patch_size, img_size=img_size
+                    )
 
-                # Save best model (only during finetuning)
-                if val_metrics['acc_avg'] > best_val_acc:
-                    best_val_acc = val_metrics['acc_avg']
-                    best_model_path = os.path.join(snapshot_path, 'best_model.pth')
+                    wandb.log({
+                        f'fold_{fold_idx+1}/val/loss_simmim': val_loss,
+                        'epoch': epoch
+                    })
 
-                    model_to_save = model.module if hasattr(model, 'module') else model
+                    logging.info(f"[Fold {fold_idx+1}] Pretrain Val - SimMIM Loss: {val_loss:.4f}")
 
-                    # 保存时过滤decoder权重
-                    state_dict = model_to_save.state_dict()
-                    filtered_state_dict = {
-                        k: v for k, v in state_dict.items()
-                        if not k.startswith('decoder.')
-                    }
+                    early_stopping(val_loss, model, os.path.join(fold_snapshot_path, 'pretrain_checkpoint.pth'))
+                    if early_stopping.early_stop:
+                        logging.info(f"[Fold {fold_idx+1}] Early stopping triggered during pretraining!")
+                        # Reset early stopping for finetuning phase
+                        early_stopping.reset()
+                        break
 
-                    torch.save(filtered_state_dict, best_model_path)
-                    logging.info(f"Best model saved with acc: {best_val_acc:.4f}")
+            else:
+                # ===== Finetune phase: Classification tasks =====
+                train_loss, train_diagnosis_loss, train_change_loss, train_metrics = train_one_epoch_finetune(
+                    model, train_loader, criterion_classification, optimizer, scheduler, device, epoch,
+                    use_timm_scheduler=False, position=1,
+                    num_diagnosis_classes=num_diagnosis_classes,
+                    num_change_classes=num_change_classes
+                )
 
-                    wandb.run.summary['best_val_acc'] = best_val_acc
-                    wandb.run.summary['best_epoch'] = epoch
+                # Log training metrics
+                wandb.log({
+                    f'fold_{fold_idx+1}/train/loss': train_loss,
+                    f'fold_{fold_idx+1}/train/loss_diagnosis': train_diagnosis_loss,
+                    f'fold_{fold_idx+1}/train/loss_change': train_change_loss,
+                    f'fold_{fold_idx+1}/train/acc_diagnosis': train_metrics['acc_diagnosis'],
+                    f'fold_{fold_idx+1}/train/acc_change': train_metrics['acc_change'],
+                    f'fold_{fold_idx+1}/train/acc_avg': train_metrics['acc_avg'],
+                    f'fold_{fold_idx+1}/train/f1_diagnosis': train_metrics['f1_diagnosis'],
+                    f'fold_{fold_idx+1}/train/f1_change': train_metrics['f1_change'],
+                    f'fold_{fold_idx+1}/train/f1_avg': train_metrics['f1_avg'],
+                    f'fold_{fold_idx+1}/train/lr': current_lr,
+                    'epoch': epoch
+                })
 
-                # Early stopping based on classification accuracy
-                early_stopping(-val_metrics['acc_avg'], model, os.path.join(snapshot_path, 'finetune_checkpoint.pth'))
-                if early_stopping.early_stop:
-                    logging.info("Early stopping triggered during finetuning!")
-                    break
+                logging.info(f"[Fold {fold_idx+1}] Finetune - Loss: {train_loss:.4f}, Acc: {train_metrics['acc_avg']:.4f}")
 
-        # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0:
-            checkpoint_path = os.path.join(snapshot_path, f'checkpoint_epoch_{epoch}.pth')
-            model_to_save = model.module if hasattr(model, 'module') else model
+                # Validation (every eval_interval epochs)
+                if (epoch + 1) % args.eval_interval == 0:
+                    val_results = validate_finetune(model, val_loader, criterion_classification, device, epoch,
+                                                    num_diagnosis_classes=num_diagnosis_classes,
+                                                    num_change_classes=num_change_classes)
 
-            # 保存时过滤decoder权重
-            state_dict = model_to_save.state_dict()
-            filtered_state_dict = {
-                k: v for k, v in state_dict.items()
-                if not k.startswith('decoder.')
-            }
+                    if len(val_results) == 6:
+                        val_loss, val_diagnosis_loss, val_change_loss, val_metrics, cm_diagnosis, cm_change = val_results
+                        all_true_diagnosis, all_pred_diagnosis, all_true_change, all_pred_change = None, None, None, None
+                    else:
+                        val_loss, val_diagnosis_loss, val_change_loss, val_metrics, cm_diagnosis, cm_change, \
+                            all_true_diagnosis, all_pred_diagnosis, all_true_change, all_pred_change = val_results
 
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': filtered_state_dict,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_acc': best_val_acc,
-                'is_pretrain': is_pretrain,
-                'phase': phase,
-                'decoder_removed': decoder_removed
-            }, checkpoint_path)
+                    # ============== Accumulate predictions for majority voting ==============
+                    # Map validation sample indices to their predictions from this fold
+                    if all_pred_diagnosis is not None and all_pred_change is not None:
+                        for local_idx, global_idx in enumerate(val_indices):
+                            if local_idx < len(all_pred_diagnosis):
+                                diagnosis_predictions_per_sample[global_idx].append(all_pred_diagnosis[local_idx])
+                                change_predictions_per_sample[global_idx].append(all_pred_change[local_idx])
+                                # Store true labels (should be consistent across folds)
+                                diagnosis_true_per_sample[global_idx] = all_true_diagnosis[local_idx]
+                                change_true_per_sample[global_idx] = all_true_change[local_idx]
 
-            logging.info(f"Checkpoint saved at epoch {epoch}")
+                    # Log validation metrics
+                    wandb.log({
+                        f'fold_{fold_idx+1}/val/loss': val_loss,
+                        f'fold_{fold_idx+1}/val/loss_diagnosis': val_diagnosis_loss,
+                        f'fold_{fold_idx+1}/val/loss_change': val_change_loss,
+                        f'fold_{fold_idx+1}/val/acc_diagnosis': val_metrics['acc_diagnosis'],
+                        f'fold_{fold_idx+1}/val/acc_change': val_metrics['acc_change'],
+                        f'fold_{fold_idx+1}/val/acc_avg': val_metrics['acc_avg'],
+                        f'fold_{fold_idx+1}/val/f1_diagnosis': val_metrics['f1_diagnosis'],
+                        f'fold_{fold_idx+1}/val/f1_change': val_metrics['f1_change'],
+                        f'fold_{fold_idx+1}/val/f1_avg': val_metrics['f1_avg'],
+                        'epoch': epoch
+                    })
 
-        overall_pbar.update(1)
+                    # Log expert utilization (only during finetuning)
+                    log_expert_utilization(model, val_loader, device, epoch, num_experts=8)
 
-    # Save final model
-    final_model_path = os.path.join(snapshot_path, 'final_model.pth')
-    model_to_save = model.module if hasattr(model, 'module') else model
+                    # Log confusion matrices
+                    fig_cm_diagnosis = create_detailed_confusion_matrix_plot(
+                        cm_diagnosis, diagnosis_names,
+                        f'Fold {fold_idx+1} - Confusion Matrix - Diagnosis (3 classes)',
+                        figsize=(8, 6)
+                    )
 
-    # 保存时过滤decoder权重
-    state_dict = model_to_save.state_dict()
-    filtered_state_dict = {
-        k: v for k, v in state_dict.items()
-        if not k.startswith('decoder.')
-    }
+                    fig_cm_change = create_detailed_confusion_matrix_plot(
+                        cm_change, change_label_names,
+                        f'Fold {fold_idx+1} - Confusion Matrix - Change Label (7 classes)',
+                        figsize=(12, 10)
+                    )
 
-    torch.save(filtered_state_dict, final_model_path)
+                    wandb.log({
+                        f'fold_{fold_idx+1}/val/confusion_matrix_diagnosis': wandb.Image(fig_cm_diagnosis),
+                        f'fold_{fold_idx+1}/val/confusion_matrix_change': wandb.Image(fig_cm_change),
+                        'epoch': epoch
+                    })
 
-    # 记录最终模型组件
-    log_model_components(model, "Final", logging.getLogger())
+                    plt.close(fig_cm_diagnosis)
+                    plt.close(fig_cm_change)
 
-    logging.info(f"\nTraining completed!")
-    if best_val_acc > 0:
-        logging.info(f"Best validation accuracy: {best_val_acc:.4f}")
+                    logging.info(f"[Fold {fold_idx+1}] Finetune Val - Loss: {val_loss:.4f}, Acc: {val_metrics['acc_avg']:.4f}")
+
+                    # Save best model (only during finetuning)
+                    if val_metrics['acc_avg'] > best_val_acc:
+                        best_val_acc = val_metrics['acc_avg']
+                        best_model_path = os.path.join(fold_snapshot_path, 'best_model.pth')
+
+                        model_to_save = model.module if hasattr(model, 'module') else model
+
+                        # Filter decoder weights when saving
+                        state_dict = model_to_save.state_dict()
+                        filtered_state_dict = {
+                            k: v for k, v in state_dict.items()
+                            if not k.startswith('decoder.')
+                        }
+
+                        torch.save(filtered_state_dict, best_model_path)
+                        logging.info(f"[Fold {fold_idx+1}] Best model saved with acc: {best_val_acc:.4f}")
+
+                        wandb.run.summary[f'fold_{fold_idx+1}/best_val_acc'] = best_val_acc
+                        wandb.run.summary[f'fold_{fold_idx+1}/best_epoch'] = epoch
+
+                    # Early stopping based on classification accuracy
+                    early_stopping(-val_metrics['acc_avg'], model,
+                                   os.path.join(fold_snapshot_path, 'finetune_checkpoint.pth'))
+                    if early_stopping.early_stop:
+                        logging.info(f"[Fold {fold_idx+1}] Early stopping triggered during finetuning!")
+                        break
+
+            # Save checkpoint
+            if (epoch + 1) % args.save_interval == 0:
+                checkpoint_path = os.path.join(fold_snapshot_path, f'checkpoint_epoch_{epoch}.pth')
+                model_to_save = model.module if hasattr(model, 'module') else model
+
+                # Filter decoder weights when saving
+                state_dict = model_to_save.state_dict()
+                filtered_state_dict = {
+                    k: v for k, v in state_dict.items()
+                    if not k.startswith('decoder.')
+                }
+
+                torch.save({
+                    'epoch': epoch,
+                    'fold': fold_idx + 1,
+                    'model_state_dict': filtered_state_dict,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'best_val_acc': best_val_acc,
+                    'is_pretrain': is_pretrain,
+                    'phase': phase,
+                    'decoder_removed': decoder_removed
+                }, checkpoint_path)
+
+                logging.info(f"[Fold {fold_idx+1}] Checkpoint saved at epoch {epoch}")
+
+            overall_pbar.update(1)
+
+        overall_pbar.close()
+
+        # Save final model for this fold
+        final_model_path = os.path.join(fold_snapshot_path, 'final_model.pth')
+        model_to_save = model.module if hasattr(model, 'module') else model
+        state_dict = model_to_save.state_dict()
+        filtered_state_dict = {
+            k: v for k, v in state_dict.items()
+            if not k.startswith('decoder.')
+        }
+        torch.save(filtered_state_dict, final_model_path)
+
+        log_model_components(model, f"Fold {fold_idx+1} Final", logging.getLogger())
+
+        # Record fold best metrics
+        fold_best_accs.append(best_val_acc)
+        logging.info(f"[Fold {fold_idx+1}] Completed. Best validation accuracy: {best_val_acc:.4f}")
+
+        # Unwrap DataParallel for next fold reset
+        if hasattr(model, 'module'):
+            model = model.module
+
+    # ============== MAJORITY VOTING ACROSS ALL FOLDS ==============
+    logging.info(f"\n{'#' * 80}")
+    logging.info(f"# MAJORITY VOTING ACROSS ALL {n_folds} FOLDS")
+    logging.info(f"{'#' * 80}")
+
+    # Perform majority voting on accumulated predictions
+    voted_diagnosis = majority_vote(diagnosis_predictions_per_sample)
+    voted_change = majority_vote(change_predictions_per_sample)
+
+    logging.info(f"Total samples with accumulated votes (diagnosis): {len(voted_diagnosis)}")
+    logging.info(f"Total samples with accumulated votes (change): {len(voted_change)}")
+
+    # Log vote count distribution
+    vote_counts = [len(v) for v in diagnosis_predictions_per_sample.values()]
+    if vote_counts:
+        logging.info(f"Vote count distribution - Min: {min(vote_counts)}, Max: {max(vote_counts)}, "
+                      f"Mean: {np.mean(vote_counts):.2f}")
+
+    # Compute majority vote metrics for diagnosis task
+    if len(voted_diagnosis) > 0 and len(diagnosis_true_per_sample) > 0:
+        mv_diagnosis_metrics = compute_majority_vote_metrics(
+            diagnosis_true_per_sample, voted_diagnosis,
+            num_diagnosis_classes, "Diagnosis (Majority Vote)"
+        )
+
+        # Log majority vote confusion matrix for diagnosis
+        fig_mv_diag = create_detailed_confusion_matrix_plot(
+            mv_diagnosis_metrics['confusion_matrix'], diagnosis_names,
+            'Majority Vote - Confusion Matrix - Diagnosis (3 classes)',
+            figsize=(8, 6)
+        )
+        wandb.log({
+            'majority_vote/acc_diagnosis': mv_diagnosis_metrics['accuracy'],
+            'majority_vote/f1_diagnosis': mv_diagnosis_metrics['f1'],
+            'majority_vote/confusion_matrix_diagnosis': wandb.Image(fig_mv_diag),
+        })
+        plt.close(fig_mv_diag)
+
+    # Compute majority vote metrics for change task
+    if len(voted_change) > 0 and len(change_true_per_sample) > 0:
+        mv_change_metrics = compute_majority_vote_metrics(
+            change_true_per_sample, voted_change,
+            num_change_classes, "Change Label (Majority Vote)"
+        )
+
+        # Log majority vote confusion matrix for change
+        fig_mv_change = create_detailed_confusion_matrix_plot(
+            mv_change_metrics['confusion_matrix'], change_label_names,
+            'Majority Vote - Confusion Matrix - Change Label (7 classes)',
+            figsize=(12, 10)
+        )
+        wandb.log({
+            'majority_vote/acc_change': mv_change_metrics['accuracy'],
+            'majority_vote/f1_change': mv_change_metrics['f1'],
+            'majority_vote/confusion_matrix_change': wandb.Image(fig_mv_change),
+        })
+        plt.close(fig_mv_change)
+
+    # ============== SUMMARY ACROSS FOLDS ==============
+    logging.info(f"\n{'=' * 80}")
+    logging.info("CROSS-VALIDATION SUMMARY")
+    logging.info(f"{'=' * 80}")
+
+    for i, acc in enumerate(fold_best_accs):
+        logging.info(f"  Fold {i+1}: Best Acc = {acc:.4f}")
+
+    mean_acc = np.mean(fold_best_accs)
+    std_acc = np.std(fold_best_accs)
+    logging.info(f"\n  Mean Best Acc: {mean_acc:.4f} ± {std_acc:.4f}")
+
+    if len(voted_diagnosis) > 0:
+        logging.info(f"  Majority Vote Diagnosis Acc: {mv_diagnosis_metrics['accuracy']:.4f}")
+        logging.info(f"  Majority Vote Diagnosis F1: {mv_diagnosis_metrics['f1']:.4f}")
+    if len(voted_change) > 0:
+        logging.info(f"  Majority Vote Change Acc: {mv_change_metrics['accuracy']:.4f}")
+        logging.info(f"  Majority Vote Change F1: {mv_change_metrics['f1']:.4f}")
+
+    logging.info(f"{'=' * 80}")
+
+    # Log summary to wandb
+    wandb.run.summary['cv/mean_best_acc'] = mean_acc
+    wandb.run.summary['cv/std_best_acc'] = std_acc
+    if len(voted_diagnosis) > 0:
+        wandb.run.summary['cv/majority_vote_diagnosis_acc'] = mv_diagnosis_metrics['accuracy']
+        wandb.run.summary['cv/majority_vote_diagnosis_f1'] = mv_diagnosis_metrics['f1']
+    if len(voted_change) > 0:
+        wandb.run.summary['cv/majority_vote_change_acc'] = mv_change_metrics['accuracy']
+        wandb.run.summary['cv/majority_vote_change_f1'] = mv_change_metrics['f1']
+
+    # Save majority vote results to file
+    mv_results_path = os.path.join(snapshot_path, 'majority_vote_results.npz')
+    np.savez(
+        mv_results_path,
+        diagnosis_voted=np.array([(k, v) for k, v in voted_diagnosis.items()]),
+        change_voted=np.array([(k, v) for k, v in voted_change.items()]),
+        diagnosis_true=np.array([(k, v) for k, v in diagnosis_true_per_sample.items()]),
+        change_true=np.array([(k, v) for k, v in change_true_per_sample.items()]),
+        fold_best_accs=np.array(fold_best_accs)
+    )
+    logging.info(f"Majority vote results saved to {mv_results_path}")
 
     wandb.finish()
-    overall_pbar.close()
 
+    logging.info(f"\nTraining completed!")
     return "Training Finished!"
 
 
-# 使用示例的参数类 - 添加SimMIM参数
+# Example Args class - with SimMIM and CV parameters
 class Args:
     def __init__(self):
-        # 基础参数
+        # Basic parameters
         self.seed = 42
         self.max_epochs = 100
         self.eval_interval = 10
         self.save_interval = 20
-        self.patience = 10  # 增加耐心值，因为预训练可能需要更长时间
+        self.patience = 10
 
-        # 优化器参数
+        # Optimizer parameters
         self.base_lr = 1e-4
         self.min_lr = 1e-6
         self.weight_decay = 1e-4
 
-        # 损失函数参数
+        # Loss function parameters
         self.weight_diagnosis = 1.0
         self.weight_change = 1.0
         self.label_smoothing = 0.1
 
-        # 训练阶段参数
-        self.pretrain_epochs = 50  # 预训练轮数
+        # Training phase parameters
+        self.pretrain_epochs = 50
 
-        # SimMIM参数
-        self.mask_ratio = 0.6  # mask比例
-        self.patch_size = 4  # patch大小
-        self.img_size = 256  # 图像大小
-        self.norm_target = True  # 是否标准化目标
-        self.norm_target_patch_size = 47  # 标准化patch大小
+        # SimMIM parameters
+        self.mask_ratio = 0.6
+        self.patch_size = 4
+        self.img_size = 256
+        self.norm_target = True
+        self.norm_target_patch_size = 47
 
-        # wandb参数
+        # wandb parameters
         self.wandb_project = "alzheimer-mmoe-nine-label"
-        self.exp_name = "dual-task-mmoe-simmim-7class"
+        self.exp_name = "dual-task-mmoe-simmim-7class-5fold-cv"
 
-        # 权重加载参数
-        self.resume = None  # 恢复训练的checkpoint路径
-        self.pretrained = None  # 预训练权重路径
+        # Weight loading parameters
+        self.resume = None
+        self.pretrained = None
 
-        # 数据参数
+        # Cross-validation parameters
+        self.n_folds = 5
+
+        # Data parameters
         self.DATA = type('obj', (object,), {
             'DATASET': 'alzheimer',
             'DATA_PATH': 'path/to/data',
@@ -1492,17 +1781,16 @@ class Args:
             'PIN_MEMORY': True
         })
 
-        # 类别数量
+        # Class counts
         self.num_classes_diagnosis = 3  # CN, MCI, AD
-        self.num_classes_change = 7  # 7个细化的change类别
+        self.num_classes_change = 7  # 7 detailed change classes
 
 
 if __name__ == "__main__":
-    # 示例用法
+    # Example usage
     args = Args()
-    # 设置预训练权重路径（如果有的话）
     # args.pretrained = "path/to/pretrained_weights.pth"
-    # args.resume = "path/to/checkpoint.pth"  # 如果要恢复训练
+    # args.resume = "path/to/checkpoint.pth"
 
     # model = SwinTransformerV2_AlzheimerMMoE_NineLabel(...)
     # snapshot_path = "./checkpoints/mmoe_nine_label_exp1"
