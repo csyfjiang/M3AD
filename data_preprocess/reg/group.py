@@ -1,30 +1,17 @@
-#!/usr/bin/env python3
-"""
-基于CSV分批处理ADNI数据
-Description: 读取CSV文件列表，按批次处理医学图像数据
-Author: yfjiang
-Date: 2025/6/4
-"""
-
-# ⚠️ 重要：在导入任何库之前设置临时目录，避免C盘空间不足
-import os
-import tempfile
-
-# 设置自定义临时目录到其他盘
 CUSTOM_TEMP_DIR = 'F:/temp'
 os.makedirs(CUSTOM_TEMP_DIR, exist_ok=True)
 
-# 设置多个临时目录环境变量
+
 os.environ['TMPDIR'] = CUSTOM_TEMP_DIR      # Linux/Unix
 os.environ['TMP'] = CUSTOM_TEMP_DIR         # Windows
 os.environ['TEMP'] = CUSTOM_TEMP_DIR        # Windows
 os.environ['TEMPDIR'] = CUSTOM_TEMP_DIR     # 备用
 
-# 设置Python的tempfile模块使用自定义目录
+
 tempfile.tempdir = CUSTOM_TEMP_DIR
 
-# print(f"🗂️  Custom temporary directory set to: {CUSTOM_TEMP_DIR}")
-# print(f"🗂️  Python tempfile directory: {tempfile.gettempdir()}")
+# print(f"  Custom temporary directory set to: {CUSTOM_TEMP_DIR}")
+# print(f"  Python tempfile directory: {tempfile.gettempdir()}")
 
 import sys
 import torch

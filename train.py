@@ -1,12 +1,4 @@
 """
-Description: 
-Author: JeffreyJ
-Date: 2025/6/25
-LastEditTime: 2025/6/25 14:22
-Version: 1.0
-"""
-# !/usr/bin/env python
-"""
 Alzheimer's Disease Dual-Task Classification Training Script with SimMIM Pretraining
 - Pretrain Phase: SimMIM reconstruction task
 - Finetune Phase: Dual classification tasks

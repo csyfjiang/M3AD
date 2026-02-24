@@ -1,19 +1,4 @@
 """
-Description: 
-Author: JeffreyJ
-Date: 2025/7/14
-LastEditTime: 2025/7/14 12:56
-Version: 2.0 - With 5-Fold Cross-Validation Support
-"""
-"""
-Description: 
-Author: JeffreyJ
-Date: 2025/6/25
-LastEditTime: 2025/6/25 14:22
-Version: 2.0 - Nine Label Version
-"""
-# !/usr/bin/env python
-"""
 Alzheimer's Disease Dual-Task Classification Training Script with SimMIM Pretraining
 Nine Label Version - 7 Change Classes - 5-Fold Cross-Validation with Majority Voting
 

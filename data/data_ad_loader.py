@@ -1,10 +1,3 @@
-"""
-简化版阿尔兹海默症NPZ数据加载器 - 支持prior向量
-- 只保留裁剪和旋转增强
-- 去除所有归一化（因为数据已经z-score标准化）
-- 添加prior向量支持
-- 打印数据范围
-"""
 import os
 import glob
 import random

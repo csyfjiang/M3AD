@@ -1,17 +1,3 @@
-"""
-Description: 
-Author: JeffreyJ
-Date: 2025/7/31
-LastEditTime: 2025/7/31 14:17
-Version: 1.0
-"""
-#!/usr/bin/env python3
-"""
-Alzheimer's Disease Dual-Task Classification Evaluation Script
-- Supports single sample inference and batch inference
-- Supports detailed evaluation metrics calculation and visualization
-"""
-
 import argparse
 import os
 import json

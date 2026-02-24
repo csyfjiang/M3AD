@@ -1,11 +1,4 @@
 """
-Description:
-Author: JeffreyJ
-Date: 2025/6/25
-LastEditTime: 2025/7/14
-Version: 3.0 - Nine Label Version with 5-Fold Cross-Validation and Majority Voting
-"""
-"""
 Alzheimer's Disease Dual-Task Classification Trainer - MMoE + SimMIM Pretraining - 7-Class Change Label
 With 5-Fold Cross-Validation and Majority Voting for Validation Predictions.
 

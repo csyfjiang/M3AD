@@ -1,10 +1,3 @@
-"""
-Description: 
-Author: JeffreyJ
-Date: 2025/7/15
-LastEditTime: 2025/7/15 13:57
-Version: 1.0
-"""
 import os
 import numpy as np
 from collections import Counter

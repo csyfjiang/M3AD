@@ -1,21 +1,3 @@
-"""
-Description: 
-Author: JeffreyJ
-Date: 2025/6/25
-LastEditTime: 2025/6/25 14:01
-Version: 1.0
-"""
-"""
-阿尔兹海默症双任务分类训练器 - MMoE版本 + SimMIM预训练
-- 预训练阶段：使用SimMIM进行自监督重建任务
-- 微调阶段：支持两个分类任务
-  - Diagnosis (1=CN, 2=MCI, 3=Dementia)
-  - Change Label (1=Stable, 2=Conversion, 3=Reversion)
-- 使用MMoE架构，分别的门控网络
-- 使用wandb记录训练过程
-- 包含早停机制
-- 智能权重管理：预训练后自动移除decoder
-"""
 import logging
 import os
 import random

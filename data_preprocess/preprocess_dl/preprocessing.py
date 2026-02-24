@@ -1,11 +1,3 @@
-"""
-Description: 
-Author: YufengJiang
-Email: yufeng.jiang@connect.polyu.hk
-Date: 2025/6/12
-LastEditTime: 2025/6/12 17:27
-Version: 1.0
-"""
 import os
 import numpy as np
 import nibabel as nib

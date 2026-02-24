@@ -1,18 +1,3 @@
-"""
-Description: 
-Author: JeffreyJ
-Date: 2025/7/14
-LastEditTime: 2025/7/14 12:52
-Version: 1.0
-"""
-# --------------------------------------------------------
-# Swin Transformer
-# Copyright (c) 2021 Microsoft
-# Licensed under The MIT License [see LICENSE for details]
-# Written by Ze Liu
-# Modified for Nine Label Version Support
-# --------------------------------------------------------
-
 import os
 import torch
 import yaml
